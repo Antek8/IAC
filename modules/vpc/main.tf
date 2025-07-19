@@ -107,6 +107,7 @@ resource "aws_security_group" "vpc_endpoint_sg" {
   }
 }
 
+# ADDED: A dedicated security group for the RAG Lambdas.
 resource "aws_security_group" "rag_lambda_sg" {
   name        = "${var.name}-rag-lambda-sg"
   description = "Allow outbound traffic from RAG Lambdas"
@@ -124,7 +125,6 @@ resource "aws_security_group" "rag_lambda_sg" {
   }
 }
 
-
 resource "aws_vpc_endpoint" "s3" {
   vpc_id            = aws_vpc.this.id
   service_name      = "com.amazonaws.${var.region}.s3"
@@ -140,9 +140,6 @@ resource "aws_vpc_endpoint" "secrets" {
   subnet_ids          = aws_subnet.private_app[*].id
   security_group_ids  = [aws_security_group.vpc_endpoint_sg.id]
 }
-
-# REMOVED: VPC Endpoints for SSM, EC2 messages, and ECR.
-# Traffic to these services will now go through the fck-nat instance.
 
 resource "aws_vpc_endpoint" "logs" {
   vpc_id              = aws_vpc.this.id

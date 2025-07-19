@@ -1,3 +1,5 @@
+# modules/rag_pipeline/variables.tf
+
 variable "name" {
   description = "Prefix (project-env-tenant) for all RAG resources"
   type        = string
@@ -34,30 +36,13 @@ variable "chunk_lambda_s3_key" {
 }
 
 variable "embed_lambda_s3_bucket" {
-  type = string
+  description = "The S3 bucket for the embed lambda function code."
+  type        = string
 }
 
 variable "embed_lambda_s3_key" {
-  type = string
-}
-
-variable "index_lambda_s3_bucket" {
-  type = string
-}
-
-variable "index_lambda_s3_key" {
-  type = string
-}
-
-variable "lambda_runtime" {
-  type    = string
-  default = "python3.9"
-}
-
-variable "secrets_manager_secret_arn" {
-  description = "ARN of a generic Secrets Manager secret Lambda can read"
+  description = "The S3 key for the embed lambda function code."
   type        = string
-  default     = null
 }
 
 variable "lambda_security_group_id" {
@@ -70,11 +55,7 @@ variable "bedrock_embed_model_arn" {
   type        = string
 }
 
-variable "qdrant_endpoint" {
-  description = "The network endpoint for the Qdrant vector database."
-  type        = string
-}
-
+# ADDED: Variable for the Qdrant API key secret ARN.
 variable "qdrant_api_key_secret_arn" {
   description = "The ARN of the Secrets Manager secret containing the Qdrant API key."
   type        = string

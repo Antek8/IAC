@@ -18,7 +18,7 @@ variable "allowed_source_security_group_ids" {
 
 variable "instance_type" {
   type    = string
-  default = "t3.medium"
+  default = "t4g.small"
 }
 
 variable "min_size" {
@@ -28,7 +28,7 @@ variable "min_size" {
 
 variable "max_size" {
   type    = number
-  default = 2
+  default = 4
 }
 
 variable "desired_capacity" {
@@ -57,9 +57,12 @@ variable "region" {
   default = "eu-central-1"
 }
 
-# ADDED: New variable to optionally specify the ECR image URI.
 variable "agentic_image_uri" {
   description = "Optional full image URI for the agentic container to pull and run. If empty, no container will be launched."
   type        = string
   default     = ""
+}
+variable "tenant_id" {
+  description = "The tenant identifier, used for naming and resource tagging."
+  type        = string
 }

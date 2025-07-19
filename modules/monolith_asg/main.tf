@@ -70,7 +70,6 @@ resource "aws_autoscaling_group" "monolith_asg" {
     version = "$Latest"
   }
   min_size            = var.min_size
-  # UPDATED: max_size is now set to 4 as requested.
   max_size            = 4
   desired_capacity    = var.desired_capacity
   vpc_zone_identifier = var.private_subnet_ids
@@ -106,6 +105,7 @@ resource "aws_iam_role" "monolith_role" {
   assume_role_policy = data.aws_iam_policy_document.monolith_assume.json
 }
 
+# ADDED: Attaching the specified managed policies directly to the role.
 resource "aws_iam_role_policy_attachment" "ssm_core" {
   role       = aws_iam_role.monolith_role.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
@@ -122,19 +122,22 @@ resource "aws_iam_role_policy_attachment" "ecr_read_only" {
 }
 
 
-# This is the correct least-privilege inline policy.
+# UPDATED: Replaced the previous broad policy with the new least-privilege inline policy.
 data "aws_iam_policy_document" "monolith_policy" {
+  # This policy grants the Monolith (UI) ASG the permissions it needs to
+  # serve the frontend, interact with the backend, and manage assets.
+
   statement {
-    sid    = "InvokeBedrock"
+    sid    = "APIGatewayInvoke"
     effect = "Allow"
     actions = [
-      "bedrock:InvokeModel"
+      "execute-api:Invoke"
     ]
-    resources = [
-      "arn:aws:bedrock:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:inference-profile/eu.meta.llama3-2-3b-instruct-v1:0",
-      "arn:aws:bedrock:${data.aws_region.current.name}::foundation-model/meta.llama3-2-3b-instruct-v1:0"
-    ]
+    # Allows the monolith's backend to call the API Gateway endpoint
+    # to initiate the secure file upload process.
+    resources = ["arn:aws:execute-api:${var.region}:${data.aws_caller_identity.current.account_id}:*/*"]
   }
+
   statement {
     sid    = "AppS3Access"
     effect = "Allow"
@@ -142,27 +145,35 @@ data "aws_iam_policy_document" "monolith_policy" {
       "s3:GetObject",
       "s3:PutObject"
     ]
-    # FIXED: The resource strings now correctly construct the S3 bucket ARN.
+    # Allows the application to read and write its own static assets,
+    # such as images, CSS, or user-generated content for the UI.
     resources = [
       "arn:aws:s3:::${var.assets_bucket}",
       "arn:aws:s3:::${var.assets_bucket}/*"
     ]
   }
-  statement {
-    sid    = "AppSQSAccess"
-    effect = "Allow"
-    actions = [
-      "sqs:*"
-    ]
-    resources = [var.sqs_queue_arn]
-  }
+
   statement {
     sid    = "AppSecretsAccess"
     effect = "Allow"
     actions = [
       "secretsmanager:GetSecretValue"
     ]
-    resources = ["arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:/myapp/*"]
+    # Allows the application to fetch its own necessary secrets,
+    # like database passwords or third-party API keys.
+    resources = ["arn:aws:secretsmanager:${var.region}:${data.aws_caller_identity.current.account_id}:secret:/myapp/${var.tenant_id}/*"]
+  }
+
+  statement {
+    sid    = "CloudWatchLogs"
+    effect = "Allow"
+    actions = [
+      "logs:CreateLogGroup",
+      "logs:CreateLogStream",
+      "logs:PutLogEvents"
+    ]
+    # Allows the EC2 instances to write application and system logs.
+    resources = ["arn:aws:logs:${var.region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/ec2/${var.name}-*"]
   }
 }
 
@@ -188,7 +199,6 @@ resource "aws_ecr_repository" "monolith" {
 # 6 Auto Scaling Policies
 ###############################################################################
 
-# ADDED: Policy to scale up the ASG by one instance.
 resource "aws_autoscaling_policy" "scale_up" {
   name                   = "${var.name}-scale-up"
   autoscaling_group_name = aws_autoscaling_group.monolith_asg.name
@@ -197,7 +207,6 @@ resource "aws_autoscaling_policy" "scale_up" {
   cooldown               = 300 # 5 minutes
 }
 
-# ADDED: CloudWatch alarm to trigger the scale-up policy when CPU is >= 70% for 5 minutes.
 resource "aws_cloudwatch_metric_alarm" "scale_up_alarm" {
   alarm_name          = "${var.name}-cpu-high-alarm"
   comparison_operator = "GreaterThanOrEqualToThreshold"
@@ -216,7 +225,6 @@ resource "aws_cloudwatch_metric_alarm" "scale_up_alarm" {
   alarm_actions     = [aws_autoscaling_policy.scale_up.arn]
 }
 
-# ADDED: Policy to scale down the ASG by one instance.
 resource "aws_autoscaling_policy" "scale_down" {
   name                   = "${var.name}-scale-down"
   autoscaling_group_name = aws_autoscaling_group.monolith_asg.name
@@ -225,7 +233,6 @@ resource "aws_autoscaling_policy" "scale_down" {
   cooldown               = 600 # 10 minutes
 }
 
-# ADDED: CloudWatch alarm to trigger the scale-down policy when CPU is <= 30% for 10 minutes.
 resource "aws_cloudwatch_metric_alarm" "scale_down_alarm" {
   alarm_name          = "${var.name}-cpu-low-alarm"
   comparison_operator = "LessThanOrEqualToThreshold"

@@ -75,11 +75,6 @@ variable "chunk_lambda_s3_key" {
   default = "chunk.zip"
 }
 
-variable "embed_lambda_s3_key" {
-  type    = string
-  default = "embed.zip"
-}
-
 variable "index_lambda_s3_key" {
   type    = string
   default = "index.zip"
@@ -107,7 +102,6 @@ variable "agentic_desired_capacity" {
   default = 1
 }
 
-# ADDED: New variable for Qdrant instance type
 variable "qdrant_instance_type" {
   description = "Instance type for the Qdrant EC2 instance."
   type        = string
@@ -126,15 +120,27 @@ variable "agentic_image_uri" {
   default     = ""
 }
 
-variable "bedrock_embed_model_arn" {
-  description = "The ARN of the Bedrock model to use for embeddings."
-  type        = string
-  default     = "arn:aws:bedrock:eu-central-1::foundation-model/amazon.titan-embed-text-v1"
-}
 
 variable "qdrant_api_key" {
   description = "The API key for the Qdrant vector database."
   type        = string
   sensitive   = true
   default     = "please-change-this-insecure-default-key"
+}
+
+variable "jwt_secret" {
+  description = "A secret key used for signing JWTs for the ContextToken."
+  type        = string
+  sensitive   = true
+  default     = "a-very-insecure-default-secret-for-dev"
+}
+
+variable "bedrock_embed_model_arn" {
+  description = "The ARN of the Bedrock model to use for embeddings."
+  type        = string
+  default     = "arn:aws:bedrock:eu-central-1::foundation-model/amazon.titan-embed-text-v1"
+}
+variable "embed_lambda_s3_key" {
+  type    = string
+  default = "embed.zip"
 }

@@ -30,6 +30,9 @@ resource "aws_security_group" "agentic_sg" {
 ###############################################################################
 # 2 IAM Role & Instance Profile
 ###############################################################################
+# ADDED: Data source to get the current AWS account ID for IAM policy construction.
+data "aws_caller_identity" "current" {}
+
 data "aws_iam_policy_document" "assume_ec2" {
   statement {
     actions = ["sts:AssumeRole"]
@@ -50,42 +53,44 @@ resource "aws_iam_role_policy_attachment" "agentic_ssm_policy" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
+# Attaching the read-only ECR policy is the best practice for this.
 resource "aws_iam_role_policy_attachment" "agentic_ecr_policy" {
   role       = aws_iam_role.agentic_role.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
 }
 
+# UPDATED: This policy now reflects the least-privilege permissions required.
 data "aws_iam_policy_document" "agentic_policy" {
+  # This policy grants the Agentic ASG the core permissions it needs to
+  # process prompts and generate AI responses.
+
   statement {
-    sid       = "Bedrock"
+    sid       = "BedrockInvoke"
     effect    = "Allow"
-    actions   = ["bedrock:*"]
+    actions   = ["bedrock:InvokeModel"]
+    # Scoped to all models for simplicity, but can be restricted to specific model ARNs.
     resources = ["*"]
   }
+
   statement {
-    sid    = "AllowS3"
+    sid       = "SecretsManagerRead"
+    effect    = "Allow"
+    actions   = ["secretsmanager:GetSecretValue"]
+    # Allows reading any secret under the application's path.
+    # This is necessary to fetch the Qdrant API key and other credentials.
+    resources = ["arn:aws:secretsmanager:${var.region}:${data.aws_caller_identity.current.account_id}:secret:/myapp/${var.tenant_id}/*"]
+  }
+
+  statement {
+    sid    = "CloudWatchLogs"
     effect = "Allow"
     actions = [
-      "s3:PutObject",
-      "s3:GetObject",
-      "s3:ListBucket"
+      "logs:CreateLogGroup",
+      "logs:CreateLogStream",
+      "logs:PutLogEvents"
     ]
-    resources = [
-      "arn:aws:s3:::${var.s3_bucket_name}",
-      "arn:aws:s3:::${var.s3_bucket_name}/*"
-    ]
-  }
-  statement {
-    sid    = "AllowSQS"
-    effect = "Allow"
-    actions = ["sqs:SendMessage"]
-    resources = [var.sqs_queue_arn]
-  }
-  statement {
-    sid    = "AllowSecrets"
-    effect = "Allow"
-    actions = ["secretsmanager:GetSecretValue"]
-    resources = [var.secrets_manager_secret_arn]
+    # Allows the EC2 instances to write logs for monitoring and debugging.
+    resources = ["arn:aws:logs:${var.region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/ec2/${var.name}-*"]
   }
 }
 
@@ -144,7 +149,6 @@ resource "aws_launch_template" "agentic_lt" {
 resource "aws_autoscaling_group" "agentic_asg" {
   name                = "${var.name}-agentic-asg"
   min_size            = var.min_size
-  # UPDATED: max_size is now set to 4 as requested.
   max_size            = 4
   desired_capacity    = var.desired_capacity
   vpc_zone_identifier = var.private_subnet_ids
@@ -179,7 +183,6 @@ resource "aws_cloudwatch_log_group" "agentic_asg_logs" {
 # 6 Auto Scaling Policies
 ###############################################################################
 
-# ADDED: Policy to scale up the ASG by one instance.
 resource "aws_autoscaling_policy" "scale_up" {
   name                   = "${var.name}-scale-up"
   autoscaling_group_name = aws_autoscaling_group.agentic_asg.name
@@ -188,7 +191,6 @@ resource "aws_autoscaling_policy" "scale_up" {
   cooldown               = 300 # 5 minutes
 }
 
-# ADDED: CloudWatch alarm to trigger the scale-up policy when CPU is >= 70% for 5 minutes.
 resource "aws_cloudwatch_metric_alarm" "scale_up_alarm" {
   alarm_name          = "${var.name}-cpu-high-alarm"
   comparison_operator = "GreaterThanOrEqualToThreshold"
@@ -207,7 +209,6 @@ resource "aws_cloudwatch_metric_alarm" "scale_up_alarm" {
   alarm_actions     = [aws_autoscaling_policy.scale_up.arn]
 }
 
-# ADDED: Policy to scale down the ASG by one instance.
 resource "aws_autoscaling_policy" "scale_down" {
   name                   = "${var.name}-scale-down"
   autoscaling_group_name = aws_autoscaling_group.agentic_asg.name
@@ -216,7 +217,6 @@ resource "aws_autoscaling_policy" "scale_down" {
   cooldown               = 600 # 10 minutes
 }
 
-# ADDED: CloudWatch alarm to trigger the scale-down policy when CPU is <= 30% for 10 minutes.
 resource "aws_cloudwatch_metric_alarm" "scale_down_alarm" {
   alarm_name          = "${var.name}-cpu-low-alarm"
   comparison_operator = "LessThanOrEqualToThreshold"
