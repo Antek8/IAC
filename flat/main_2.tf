@@ -63,6 +63,7 @@ module "fck_nat" {
   subnet_id = aws_subnet.public[0].id
   ha_mode   = false
 
+  # This is set to false to break the dependency cycle that hangs on destroy.
   update_route_tables = false
 }
 
@@ -72,6 +73,8 @@ resource "aws_route_table" "private" {
   tags   = { Name = "${var.name}-private-rt" }
 }
 
+# Explicitly create the route to the fck-nat ENI here.
+# This makes the dependency chain clearer for Terraform during creation and deletion.
 resource "aws_route" "private_nat_route" {
   route_table_id         = aws_route_table.private.id
   destination_cidr_block = "0.0.0.0/0"
@@ -141,12 +144,54 @@ resource "aws_vpc_endpoint" "secrets" {
   security_group_ids  = [aws_security_group.vpc_endpoint_sg.id]
 }
 
-# REMOVED: VPC Endpoints for SSM, EC2 messages, and ECR.
-# Traffic to these services will now go through the fck-nat instance.
+resource "aws_vpc_endpoint" "ssm" {
+  vpc_id              = aws_vpc.this.id
+  service_name        = "com.amazonaws.${var.region}.ssm"
+  vpc_endpoint_type   = "Interface"
+  private_dns_enabled = true
+  subnet_ids          = aws_subnet.private_app[*].id
+  security_group_ids  = [aws_security_group.vpc_endpoint_sg.id]
+}
+
+resource "aws_vpc_endpoint" "ssmmessages" {
+  vpc_id              = aws_vpc.this.id
+  service_name        = "com.amazonaws.${var.region}.ssmmessages"
+  vpc_endpoint_type   = "Interface"
+  private_dns_enabled = true
+  subnet_ids          = aws_subnet.private_app[*].id
+  security_group_ids  = [aws_security_group.vpc_endpoint_sg.id]
+}
+
+resource "aws_vpc_endpoint" "ec2messages" {
+  vpc_id              = aws_vpc.this.id
+  service_name        = "com.amazonaws.${var.region}.ec2messages"
+  vpc_endpoint_type   = "Interface"
+  private_dns_enabled = true
+  subnet_ids          = aws_subnet.private_app[*].id
+  security_group_ids  = [aws_security_group.vpc_endpoint_sg.id]
+}
 
 resource "aws_vpc_endpoint" "logs" {
   vpc_id              = aws_vpc.this.id
   service_name        = "com.amazonaws.${var.region}.logs"
+  vpc_endpoint_type   = "Interface"
+  private_dns_enabled = true
+  subnet_ids          = aws_subnet.private_app[*].id
+  security_group_ids  = [aws_security_group.vpc_endpoint_sg.id]
+}
+
+resource "aws_vpc_endpoint" "ecr_api" {
+  vpc_id              = aws_vpc.this.id
+  service_name        = "com.amazonaws.${var.region}.ecr.api"
+  vpc_endpoint_type   = "Interface"
+  private_dns_enabled = true
+  subnet_ids          = aws_subnet.private_app[*].id
+  security_group_ids  = [aws_security_group.vpc_endpoint_sg.id]
+}
+
+resource "aws_vpc_endpoint" "ecr_dkr" {
+  vpc_id              = aws_vpc.this.id
+  service_name        = "com.amazonaws.${var.region}.ecr.dkr"
   vpc_endpoint_type   = "Interface"
   private_dns_enabled = true
   subnet_ids          = aws_subnet.private_app[*].id

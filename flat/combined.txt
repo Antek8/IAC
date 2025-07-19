@@ -1,0 +1,2197 @@
+# envs/prod/backend.tf
+
+terraform {
+  required_version = ">= 1.3.0"
+  required_providers {
+    aws = { source = "hashicorp/aws", version = "~> 5.0" }
+  }
+  backend "s3" {
+    bucket         = "kane-backend-bucket"
+    key            = "dev/terraform.tfstate"
+    region         = "eu-central-1" # Hardcoded region
+    dynamodb_table = "kane-terraform-db"
+    encrypt        = true
+  }
+}# envs/dev/backend.tf
+terraform {
+  required_version = ">= 1.3.0"
+  required_providers {
+    aws = { source = "hashicorp/aws", version = "~> 5.0" }
+    # ADDED: The 'random' provider is needed for the secret name fix.
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.5"
+    }
+  }
+  backend "s3" {
+    bucket         = "kane-backend-bucket"
+    key            = "dev/terraform.tfstate"
+    region         = "eu-central-1" # Hardcoded region
+    dynamodb_table = "kane-terraform-db"
+    encrypt        = true
+  }
+}# envs/dev/budgets.tf
+
+# COST OPTIMIZATION: Add a budget to monitor costs and send alerts.
+resource "aws_budgets_budget" "monthly_ec2" {
+  name         = "monthly-ec2-cost-budget"
+  budget_type  = "COST"
+  limit_amount = "100.0" # Set your desired budget limit
+  limit_unit   = "USD"
+  time_unit    = "MONTHLY"
+
+  # FIXED: The argument is 'cost_filter' (singular), not 'cost_filters'.
+  cost_filter {
+    name   = "Service"
+    values = ["Amazon Elastic Compute Cloud - Compute"]
+  }
+
+  notification {
+    comparison_operator        = "GREATER_THAN"
+    threshold                  = 80 # Alert at 80% of the budget
+    threshold_type             = "PERCENTAGE"
+    notification_type          = "FORECASTED"
+    subscriber_email_addresses = ["antoni.wlodarski@securitykane.com"] # Replace with your email
+  }
+}
+locals {
+  name_prefix = "${var.project}-${var.environment}-${var.tenant_id}"
+}
+
+data "aws_availability_zones" "available" {}
+# envs/dev/locals.tf
+
+locals {
+  # FIXED: Enforce lowercase on the name_prefix to comply with AWS naming
+  # conventions for resources like S3 buckets and ECR repositories.
+  name_prefix = lower("${var.project}-${var.environment}-${var.tenant_id}")
+}
+
+data "aws_availability_zones" "azs" {}
+# modules/agentic_asg/main.tf
+
+###############################################################################
+# 1 Security Group
+###############################################################################
+resource "aws_security_group" "agentic_sg" {
+  name        = "${var.name}-agentic-sg"
+  description = "Allow web ASG to talk to Agentic logic"
+  vpc_id      = var.vpc_id
+
+  dynamic "ingress" {
+    for_each = var.allowed_source_security_group_ids
+    content {
+      from_port       = 80
+      to_port         = 80
+      protocol        = "tcp"
+      security_groups = [ingress.value]
+      description     = "Allow web ASG"
+    }
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+###############################################################################
+# 2 IAM Role & Instance Profile
+###############################################################################
+data "aws_iam_policy_document" "assume_ec2" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["ec2.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "agentic_role" {
+  name               = "${var.name}-agentic-role"
+  assume_role_policy = data.aws_iam_policy_document.assume_ec2.json
+}
+
+resource "aws_iam_role_policy_attachment" "agentic_ssm_policy" {
+  role       = aws_iam_role.agentic_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_role_policy_attachment" "agentic_ecr_policy" {
+  role       = aws_iam_role.agentic_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+}
+
+data "aws_iam_policy_document" "agentic_policy" {
+  statement {
+    sid       = "Bedrock"
+    effect    = "Allow"
+    actions   = ["bedrock:*"]
+    resources = ["*"]
+  }
+  statement {
+    sid    = "AllowS3"
+    effect = "Allow"
+    actions = [
+      "s3:PutObject",
+      "s3:GetObject",
+      "s3:ListBucket"
+    ]
+    resources = [
+      "arn:aws:s3:::${var.s3_bucket_name}",
+      "arn:aws:s3:::${var.s3_bucket_name}/*"
+    ]
+  }
+  statement {
+    sid    = "AllowSQS"
+    effect = "Allow"
+    actions = ["sqs:SendMessage"]
+    resources = [var.sqs_queue_arn]
+  }
+  statement {
+    sid    = "AllowSecrets"
+    effect = "Allow"
+    actions = ["secretsmanager:GetSecretValue"]
+    resources = [var.secrets_manager_secret_arn]
+  }
+}
+
+resource "aws_iam_role_policy" "agentic_policy" {
+  name   = "${var.name}-agentic-inline-policy"
+  role   = aws_iam_role.agentic_role.id
+  policy = data.aws_iam_policy_document.agentic_policy.json
+}
+resource "aws_iam_instance_profile" "agentic_profile" {
+  name = "${var.name}-agentic-profile"
+  role = aws_iam_role.agentic_role.name
+}
+
+###############################################################################
+# 3 Launch Template
+###############################################################################
+data "aws_ami" "linux_arm" {
+  owners      = ["amazon"]
+  most_recent = true
+  filter {
+    name   = "name"
+    values = ["amzn2-ami-hvm-*-arm64-gp2"]
+  }
+}
+
+resource "aws_launch_template" "agentic_lt" {
+  name_prefix   = "${var.name}-agentic-lt-"
+  image_id      = data.aws_ami.linux_arm.id
+  instance_type = var.instance_type
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.agentic_profile.name
+  }
+
+  metadata_options {
+    http_tokens   = "required"
+    http_endpoint = "enabled"
+  }
+
+  network_interfaces {
+    device_index                = 0
+    subnet_id                   = element(var.private_subnet_ids, 0)
+    security_groups             = [aws_security_group.agentic_sg.id]
+    associate_public_ip_address = false
+  }
+
+  user_data = base64encode(templatefile("${path.module}/user_data.sh.tpl", {
+    region            = var.region
+    agentic_image_uri = var.agentic_image_uri
+  }))
+}
+
+###############################################################################
+# 4 Auto Scaling Group
+###############################################################################
+resource "aws_autoscaling_group" "agentic_asg" {
+  name                = "${var.name}-agentic-asg"
+  min_size            = var.min_size
+  # UPDATED: max_size is now set to 4 as requested.
+  max_size            = 4
+  desired_capacity    = var.desired_capacity
+  vpc_zone_identifier = var.private_subnet_ids
+
+  launch_template {
+    id      = aws_launch_template.agentic_lt.id
+    version = "$Latest"
+  }
+
+  health_check_type = "EC2"
+
+  tag {
+    key                 = "Name"
+    value               = "${var.name}-agentic"
+    propagate_at_launch = true
+  }
+}
+
+###############################################################################
+# 5 ECR Repository & CloudWatch Logs
+###############################################################################
+resource "aws_ecr_repository" "agentic" {
+  name = lower("${var.name}-agentic")
+}
+
+resource "aws_cloudwatch_log_group" "agentic_asg_logs" {
+  name              = "/aws/ec2/${var.name}-agentic"
+  retention_in_days = 7
+}
+
+###############################################################################
+# 6 Auto Scaling Policies
+###############################################################################
+
+# ADDED: Policy to scale up the ASG by one instance.
+resource "aws_autoscaling_policy" "scale_up" {
+  name                   = "${var.name}-scale-up"
+  autoscaling_group_name = aws_autoscaling_group.agentic_asg.name
+  adjustment_type        = "ChangeInCapacity"
+  scaling_adjustment     = 1
+  cooldown               = 300 # 5 minutes
+}
+
+# ADDED: CloudWatch alarm to trigger the scale-up policy when CPU is >= 70% for 5 minutes.
+resource "aws_cloudwatch_metric_alarm" "scale_up_alarm" {
+  alarm_name          = "${var.name}-cpu-high-alarm"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = "1"
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = "300" # 5 minutes in seconds
+  statistic           = "Average"
+  threshold           = "70"
+
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.agentic_asg.name
+  }
+
+  alarm_description = "This metric monitors ec2 cpu utilization"
+  alarm_actions     = [aws_autoscaling_policy.scale_up.arn]
+}
+
+# ADDED: Policy to scale down the ASG by one instance.
+resource "aws_autoscaling_policy" "scale_down" {
+  name                   = "${var.name}-scale-down"
+  autoscaling_group_name = aws_autoscaling_group.agentic_asg.name
+  adjustment_type        = "ChangeInCapacity"
+  scaling_adjustment     = -1
+  cooldown               = 600 # 10 minutes
+}
+
+# ADDED: CloudWatch alarm to trigger the scale-down policy when CPU is <= 30% for 10 minutes.
+resource "aws_cloudwatch_metric_alarm" "scale_down_alarm" {
+  alarm_name          = "${var.name}-cpu-low-alarm"
+  comparison_operator = "LessThanOrEqualToThreshold"
+  evaluation_periods  = "1"
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = "600" # 10 minutes in seconds
+  statistic           = "Average"
+  threshold           = "30"
+
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.agentic_asg.name
+  }
+
+  alarm_description = "This metric monitors ec2 cpu utilization"
+  alarm_actions     = [aws_autoscaling_policy.scale_down.arn]
+}
+# modules/rag_pipeline/main.tf
+
+###############################################################################
+# 1. S3 Bucket & SQS Queues
+###############################################################################
+
+resource "aws_s3_bucket" "this" {
+  bucket = "${var.name}-rag-chuncky"
+}
+
+resource "aws_s3_bucket_ownership_controls" "this" {
+  bucket = aws_s3_bucket.this.id
+  rule {
+    object_ownership = "BucketOwnerPreferred"
+  }
+}
+resource "aws_s3_bucket_acl" "this" {
+  depends_on = [aws_s3_bucket_ownership_controls.this]
+  bucket     = aws_s3_bucket.this.id
+  acl        = "private"
+}
+resource "aws_s3_bucket_versioning" "this" {
+  bucket = aws_s3_bucket.this.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+resource "aws_s3_bucket_server_side_encryption_configuration" "this" {
+  bucket = aws_s3_bucket.this.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+
+resource "aws_sqs_queue" "dlq" {
+  name                      = "${var.name}-rag-dlq"
+  message_retention_seconds = 1209600 # 14 days
+}
+
+resource "aws_sqs_queue" "main" {
+  name                       = "${var.name}-rag-queue"
+  visibility_timeout_seconds = 60
+
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.dlq.arn
+    maxReceiveCount     = 5
+  })
+}
+
+###############################################################################
+# 2. Chunk-Splitter Lambda
+###############################################################################
+
+resource "aws_iam_role" "chunk_lambda_role" {
+  name               = "${var.name}-chunk-lambda-role"
+  assume_role_policy = data.aws_iam_policy_document.assume_lambda.json
+}
+
+resource "aws_iam_role_policy_attachment" "chunk_vpc_access" {
+  role       = aws_iam_role.chunk_lambda_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+}
+
+resource "aws_iam_role_policy" "chunk_lambda_policy" {
+  name   = "${var.name}-chunk-lambda-policy"
+  role   = aws_iam_role.chunk_lambda_role.id
+  policy = jsonencode({
+    Version   = "2012-10-17",
+    Statement = [
+      {
+        Sid    = "S3GetObject",
+        Effect = "Allow",
+        Action = "s3:GetObject",
+        Resource = "${aws_s3_bucket.this.arn}/*"
+      },
+      {
+        Sid    = "SQSSendMessage",
+        Effect = "Allow",
+        Action = "sqs:SendMessage",
+        Resource = aws_sqs_queue.main.arn
+      }
+    ]
+  })
+}
+
+resource "aws_cloudwatch_log_group" "chunk_lambda_logs" {
+  name              = "/aws/lambda/${var.name}-chunk"
+  retention_in_days = 7
+}
+
+resource "aws_lambda_function" "chunk" {
+  function_name    = "${var.name}-chunk"
+  s3_bucket        = var.chunk_lambda_s3_bucket
+  s3_key           = var.chunk_lambda_s3_key
+  handler          = "chunk.lambda_handler"
+  runtime          = var.lambda_runtime
+  role             = aws_iam_role.chunk_lambda_role.arn
+  timeout          = 15
+  memory_size      = 256
+
+  vpc_config {
+    subnet_ids         = var.private_subnet_ids
+    security_group_ids = [var.lambda_security_group_id]
+  }
+
+  environment {
+    variables = {
+      SOURCE_BUCKET   = aws_s3_bucket.this.id
+      CHUNK_QUEUE_URL = aws_sqs_queue.main.id
+      CHUNK_SIZE      = "1024" # Example value
+    }
+  }
+
+  tracing_config {
+    mode = "Active" # Enable X-Ray Tracing as requested
+  }
+
+  depends_on = [aws_cloudwatch_log_group.chunk_lambda_logs]
+}
+
+
+###############################################################################
+# 3. Embedding Lambda
+###############################################################################
+
+resource "aws_iam_role" "embed_lambda_role" {
+  name               = "${var.name}-embed-lambda-role"
+  assume_role_policy = data.aws_iam_policy_document.assume_lambda.json
+}
+
+resource "aws_iam_role_policy_attachment" "embed_vpc_access" {
+  role       = aws_iam_role.embed_lambda_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+}
+
+resource "aws_iam_role_policy" "embed_lambda_policy" {
+  name   = "${var.name}-embed-lambda-policy"
+  role   = aws_iam_role.embed_lambda_role.id
+  policy = jsonencode({
+    Version   = "2012-10-17",
+    Statement = [
+      {
+        Sid      = "BedrockInvoke",
+        Effect   = "Allow",
+        Action   = "bedrock:InvokeModel",
+        Resource = var.bedrock_embed_model_arn
+      },
+      {
+        Sid      = "S3Access",
+        Effect   = "Allow",
+        Action   = ["s3:GetObject", "s3:PutObject"],
+        Resource = "${aws_s3_bucket.this.arn}/*"
+      },
+      {
+        Sid      = "SQSRead",
+        Effect   = "Allow",
+        Action   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"],
+        Resource = aws_sqs_queue.main.arn
+      }
+    ]
+  })
+}
+
+resource "aws_cloudwatch_log_group" "embed_lambda_logs" {
+  name              = "/aws/lambda/${var.name}-embed"
+  retention_in_days = 7
+}
+
+resource "aws_lambda_function" "embed" {
+  function_name    = "${var.name}-embed"
+  s3_bucket        = var.embed_lambda_s3_bucket
+  s3_key           = var.embed_lambda_s3_key
+  handler          = "embed_processor.lambda_handler"
+  runtime          = var.lambda_runtime
+  role             = aws_iam_role.embed_lambda_role.arn
+  timeout          = 30
+  memory_size      = 512
+
+  vpc_config {
+    subnet_ids         = var.private_subnet_ids
+    security_group_ids = [var.lambda_security_group_id]
+  }
+
+  environment {
+    variables = {
+      EMBED_BUCKET            = aws_s3_bucket.this.id
+      BEDROCK_EMBED_MODEL_ARN = var.bedrock_embed_model_arn
+    }
+  }
+
+  tracing_config {
+    mode = "PassThrough"
+  }
+
+  depends_on = [aws_cloudwatch_log_group.embed_lambda_logs]
+}
+
+
+###############################################################################
+# 4. Indexer Lambda
+###############################################################################
+
+resource "aws_iam_role" "index_lambda_role" {
+  name               = "${var.name}-index-lambda-role"
+  assume_role_policy = data.aws_iam_policy_document.assume_lambda.json
+}
+
+resource "aws_iam_role_policy_attachment" "index_vpc_access" {
+  role       = aws_iam_role.index_lambda_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+}
+
+resource "aws_iam_role_policy" "index_secrets_policy" {
+  name = "${var.name}-index-secrets-policy"
+  role = aws_iam_role.index_lambda_role.id
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Sid    = "AllowSecrets",
+        Effect = "Allow",
+        Action = "secretsmanager:GetSecretValue",
+        Resource = var.qdrant_api_key_secret_arn
+      }
+    ]
+  })
+}
+
+resource "aws_cloudwatch_log_group" "index_lambda_logs" {
+  name              = "/aws/lambda/${var.name}-index"
+  retention_in_days = 7
+}
+
+resource "aws_lambda_function" "index" {
+  function_name    = "${var.name}-index"
+  s3_bucket        = var.index_lambda_s3_bucket
+  s3_key           = var.index_lambda_s3_key
+  handler          = "index_lambda.lambda_handler"
+  runtime          = var.lambda_runtime
+  role             = aws_iam_role.index_lambda_role.arn
+  timeout          = 15
+  memory_size      = 256
+
+  vpc_config {
+    subnet_ids         = var.private_subnet_ids
+    security_group_ids = [var.lambda_security_group_id]
+  }
+
+  environment {
+    variables = {
+      QDRANT_ENDPOINT    = var.qdrant_endpoint
+      API_KEY_SECRET_ARN = var.qdrant_api_key_secret_arn
+    }
+  }
+
+  tracing_config {
+    mode = "PassThrough"
+  }
+
+  depends_on = [aws_cloudwatch_log_group.index_lambda_logs]
+}
+
+# Common data source used by all Lambda roles
+data "aws_iam_policy_document" "assume_lambda" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["lambda.amazonaws.com"]
+    }
+  }
+}
+# modules/vpc/main.tf
+
+resource "aws_vpc" "this" {
+  cidr_block           = var.cidr
+  enable_dns_hostnames = true
+  tags                 = { Name = "${var.name}-vpc" }
+}
+
+data "aws_availability_zones" "azs" {}
+
+resource "aws_subnet" "public" {
+  count                   = length(var.public_subnet_cidrs)
+  vpc_id                  = aws_vpc.this.id
+  availability_zone       = data.aws_availability_zones.azs.names[count.index]
+  cidr_block              = var.public_subnet_cidrs[count.index]
+  map_public_ip_on_launch = true
+  tags                    = { Name = "${var.name}-public-${count.index}" }
+}
+
+resource "aws_subnet" "private_app" {
+  count             = length(var.private_app_subnet_cidrs)
+  vpc_id            = aws_vpc.this.id
+  availability_zone = data.aws_availability_zones.azs.names[count.index]
+  cidr_block        = var.private_app_subnet_cidrs[count.index]
+  tags              = { Name = "${var.name}-priv-app-${count.index}" }
+}
+
+resource "aws_subnet" "private_rag" {
+  count             = length(var.private_rag_subnet_cidrs)
+  vpc_id            = aws_vpc.this.id
+  availability_zone = data.aws_availability_zones.azs.names[count.index]
+  cidr_block        = var.private_rag_subnet_cidrs[count.index]
+  tags              = { Name = "${var.name}-priv-rag-${count.index}" }
+}
+
+# 2 Internet Gateway & Public Route Table
+resource "aws_internet_gateway" "igw" {
+  vpc_id = aws_vpc.this.id
+  tags   = { Name = "${var.name}-igw" }
+}
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.this.id
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.igw.id
+  }
+  tags = { Name = "${var.name}-public-rt" }
+}
+
+resource "aws_route_table_association" "public_assoc" {
+  count          = length(var.public_subnet_cidrs)
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public.id
+}
+
+# 3. fck-nat Module for cost-effective NAT
+module "fck_nat" {
+  source = "github.com/RaJiska/terraform-aws-fck-nat"
+
+  name      = "${var.name}-fck-nat"
+  vpc_id    = aws_vpc.this.id
+  subnet_id = aws_subnet.public[0].id
+  ha_mode   = false
+
+  # This is set to false to break the dependency cycle that hangs on destroy.
+  update_route_tables = false
+}
+
+# 4. Private Route Table
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.this.id
+  tags   = { Name = "${var.name}-private-rt" }
+}
+
+# Explicitly create the route to the fck-nat ENI here.
+# This makes the dependency chain clearer for Terraform during creation and deletion.
+resource "aws_route" "private_nat_route" {
+  route_table_id         = aws_route_table.private.id
+  destination_cidr_block = "0.0.0.0/0"
+  network_interface_id   = module.fck_nat.eni_id
+}
+
+# Associate the private route table with the private subnets
+resource "aws_route_table_association" "private_app_assoc" {
+  count          = length(var.private_app_subnet_cidrs)
+  subnet_id      = aws_subnet.private_app[count.index].id
+  route_table_id = aws_route_table.private.id
+}
+
+resource "aws_route_table_association" "private_rag_assoc" {
+  count          = length(var.private_rag_subnet_cidrs)
+  subnet_id      = aws_subnet.private_rag[count.index].id
+  route_table_id = aws_route_table.private.id
+}
+
+
+# 5. VPC Endpoints
+resource "aws_security_group" "vpc_endpoint_sg" {
+  name        = "${var.name}-vpc-endpoint-sg"
+  description = "Allow HTTPS from within the VPC to interface endpoints"
+  vpc_id      = aws_vpc.this.id
+
+  ingress {
+    description = "Allow HTTPS from VPC"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = [aws_vpc.this.cidr_block]
+  }
+}
+
+resource "aws_security_group" "rag_lambda_sg" {
+  name        = "${var.name}-rag-lambda-sg"
+  description = "Allow outbound traffic from RAG Lambdas"
+  vpc_id      = aws_vpc.this.id
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "${var.name}-rag-lambda-sg"
+  }
+}
+
+
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = aws_vpc.this.id
+  service_name      = "com.amazonaws.${var.region}.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = [aws_route_table.public.id, aws_route_table.private.id]
+}
+
+resource "aws_vpc_endpoint" "secrets" {
+  vpc_id              = aws_vpc.this.id
+  service_name        = "com.amazonaws.${var.region}.secretsmanager"
+  vpc_endpoint_type   = "Interface"
+  private_dns_enabled = true
+  subnet_ids          = aws_subnet.private_app[*].id
+  security_group_ids  = [aws_security_group.vpc_endpoint_sg.id]
+}
+
+resource "aws_vpc_endpoint" "ssm" {
+  vpc_id              = aws_vpc.this.id
+  service_name        = "com.amazonaws.${var.region}.ssm"
+  vpc_endpoint_type   = "Interface"
+  private_dns_enabled = true
+  subnet_ids          = aws_subnet.private_app[*].id
+  security_group_ids  = [aws_security_group.vpc_endpoint_sg.id]
+}
+
+resource "aws_vpc_endpoint" "ssmmessages" {
+  vpc_id              = aws_vpc.this.id
+  service_name        = "com.amazonaws.${var.region}.ssmmessages"
+  vpc_endpoint_type   = "Interface"
+  private_dns_enabled = true
+  subnet_ids          = aws_subnet.private_app[*].id
+  security_group_ids  = [aws_security_group.vpc_endpoint_sg.id]
+}
+
+resource "aws_vpc_endpoint" "ec2messages" {
+  vpc_id              = aws_vpc.this.id
+  service_name        = "com.amazonaws.${var.region}.ec2messages"
+  vpc_endpoint_type   = "Interface"
+  private_dns_enabled = true
+  subnet_ids          = aws_subnet.private_app[*].id
+  security_group_ids  = [aws_security_group.vpc_endpoint_sg.id]
+}
+
+resource "aws_vpc_endpoint" "logs" {
+  vpc_id              = aws_vpc.this.id
+  service_name        = "com.amazonaws.${var.region}.logs"
+  vpc_endpoint_type   = "Interface"
+  private_dns_enabled = true
+  subnet_ids          = aws_subnet.private_app[*].id
+  security_group_ids  = [aws_security_group.vpc_endpoint_sg.id]
+}
+
+resource "aws_vpc_endpoint" "ecr_api" {
+  vpc_id              = aws_vpc.this.id
+  service_name        = "com.amazonaws.${var.region}.ecr.api"
+  vpc_endpoint_type   = "Interface"
+  private_dns_enabled = true
+  subnet_ids          = aws_subnet.private_app[*].id
+  security_group_ids  = [aws_security_group.vpc_endpoint_sg.id]
+}
+
+resource "aws_vpc_endpoint" "ecr_dkr" {
+  vpc_id              = aws_vpc.this.id
+  service_name        = "com.amazonaws.${var.region}.ecr.dkr"
+  vpc_endpoint_type   = "Interface"
+  private_dns_enabled = true
+  subnet_ids          = aws_subnet.private_app[*].id
+  security_group_ids  = [aws_security_group.vpc_endpoint_sg.id]
+}
+data "aws_iam_policy_document" "assume_ec2" {
+  statement {
+    effect = "Allow"
+    principals {
+      type        = "Service"
+      identifiers = ["ec2.amazonaws.com"]
+    }
+    actions = ["sts:AssumeRole"]
+  }
+}
+
+resource "aws_iam_role" "agentic_role" {
+  name               = "${var.name}-agentic-role"
+  assume_role_policy = data.aws_iam_policy_document.assume_ec2.json
+}
+
+data "aws_iam_policy_document" "agentic_policy" {
+  statement {
+    sid      = "AllowBedrock"
+    effect   = "Allow"
+    actions  = ["bedrock:*"]
+    resources = ["*"]
+  }
+  statement {
+    sid      = "AllowS3"
+    effect   = "Allow"
+    actions  = [
+      "s3:PutObject",
+      "s3:GetObject",
+      "s3:ListBucket"
+    ]
+    resources = [
+      "arn:aws:s3:::${var.s3_bucket_name}",
+      "arn:aws:s3:::${var.s3_bucket_name}/*"
+    ]
+  }
+  statement {
+    sid      = "AllowSQS"
+    effect   = "Allow"
+    actions  = ["sqs:SendMessage"]
+    resources = [var.sqs_queue_arn]
+  }
+  statement {
+    sid      = "AllowSecrets"
+    effect   = "Allow"
+    actions  = ["secretsmanager:GetSecretValue"]
+    resources = [var.secrets_manager_secret_arn]
+  }
+  statement {
+    sid      = "AllowCloudWatchLogs"
+    effect   = "Allow"
+    actions  = [
+      "logs:CreateLogGroup",
+      "logs:CreateLogStream",
+      "logs:PutLogEvents"
+    ]
+    resources = ["arn:aws:logs:${var.region}:*:log-group:/aws/ec2/${var.name}-agentic*"]
+  }
+  statement {
+    sid      = "AllowXRay"
+    effect   = "Allow"
+    actions  = [
+      "xray:PutTraceSegments",
+      "xray:PutTelemetryRecords",
+      "xray:PutInsightEvents"
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "agentic_policy" {
+  name   = "${var.name}-agentic-policy"
+  role   = aws_iam_role.agentic_role.id
+  policy = data.aws_iam_policy_document.agentic_policy.json
+}
+
+resource "aws_iam_instance_profile" "agentic_profile" {
+  name = "${var.name}-agentic-profile"
+  role = aws_iam_role.agentic_role.name
+}
+# modules/monolith_asg/main.tf
+
+###############################################################################
+# 1 Monolith EC2 Security Group
+###############################################################################
+resource "aws_security_group" "monolith" {
+  name        = "${var.name}-sg"
+  description = "Allow HTTP inbound to Monolith (React + Supertokens)"
+  vpc_id      = var.vpc_id
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+###############################################################################
+# 2 Launch Template
+###############################################################################
+data "aws_ami" "linux_arm" {
+  owners      = ["amazon"]
+  most_recent = true
+  filter {
+    name   = "name"
+    values = ["amzn2-ami-hvm-*-arm64-gp2"]
+  }
+}
+
+resource "aws_launch_template" "monolith" {
+  name_prefix   = "${var.name}-lt-"
+  image_id      = data.aws_ami.linux_arm.id
+  instance_type = var.instance_type
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.monolith_profile.name
+  }
+
+  metadata_options {
+    http_tokens   = "required"
+    http_endpoint = "enabled"
+  }
+
+  network_interfaces {
+    subnet_id                   = element(var.private_subnet_ids, 0)
+    security_groups             = [aws_security_group.monolith.id]
+    associate_public_ip_address = false
+  }
+
+  user_data = base64encode(templatefile("${path.module}/user_data.sh.tpl", {
+    region             = var.region
+    monolith_image_uri = var.monolith_image_uri
+  }))
+}
+
+###############################################################################
+# 3 ASG
+###############################################################################
+resource "aws_autoscaling_group" "monolith_asg" {
+  name = "${var.name}-asg"
+  launch_template {
+    id      = aws_launch_template.monolith.id
+    version = "$Latest"
+  }
+  min_size            = var.min_size
+  # UPDATED: max_size is now set to 4 as requested.
+  max_size            = 4
+  desired_capacity    = var.desired_capacity
+  vpc_zone_identifier = var.private_subnet_ids
+
+  health_check_type = "EC2"
+
+  tag {
+    key                 = "Name"
+    value               = "${var.name}-monolith"
+    propagate_at_launch = true
+  }
+}
+
+
+##################################################################
+### IAM Role for Monolith EC2 ###
+##################################################################
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+
+data "aws_iam_policy_document" "monolith_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["ec2.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "monolith_role" {
+  name               = "${var.name}-monolith-role"
+  assume_role_policy = data.aws_iam_policy_document.monolith_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "ssm_core" {
+  role       = aws_iam_role.monolith_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_for_ec2" {
+  role       = aws_iam_role.monolith_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
+}
+
+resource "aws_iam_role_policy_attachment" "ecr_read_only" {
+  role       = aws_iam_role.monolith_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+}
+
+
+# This is the correct least-privilege inline policy.
+data "aws_iam_policy_document" "monolith_policy" {
+  statement {
+    sid    = "InvokeBedrock"
+    effect = "Allow"
+    actions = [
+      "bedrock:InvokeModel"
+    ]
+    resources = [
+      "arn:aws:bedrock:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:inference-profile/eu.meta.llama3-2-3b-instruct-v1:0",
+      "arn:aws:bedrock:${data.aws_region.current.name}::foundation-model/meta.llama3-2-3b-instruct-v1:0"
+    ]
+  }
+  statement {
+    sid    = "AppS3Access"
+    effect = "Allow"
+    actions = [
+      "s3:GetObject",
+      "s3:PutObject"
+    ]
+    # FIXED: The resource strings now correctly construct the S3 bucket ARN.
+    resources = [
+      "arn:aws:s3:::${var.assets_bucket}",
+      "arn:aws:s3:::${var.assets_bucket}/*"
+    ]
+  }
+  statement {
+    sid    = "AppSQSAccess"
+    effect = "Allow"
+    actions = [
+      "sqs:*"
+    ]
+    resources = [var.sqs_queue_arn]
+  }
+  statement {
+    sid    = "AppSecretsAccess"
+    effect = "Allow"
+    actions = [
+      "secretsmanager:GetSecretValue"
+    ]
+    resources = ["arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:/myapp/*"]
+  }
+}
+
+resource "aws_iam_role_policy" "monolith_policy" {
+  name   = "${var.name}-monolith-inline-policy"
+  role   = aws_iam_role.monolith_role.id
+  policy = data.aws_iam_policy_document.monolith_policy.json
+}
+
+resource "aws_iam_instance_profile" "monolith_profile" {
+  name = "${var.name}-monolith-profile"
+  role = aws_iam_role.monolith_role.name
+}
+
+###############################################################################
+# 5 ECR Repository
+###############################################################################
+resource "aws_ecr_repository" "monolith" {
+  name = lower("${var.name}-monolith")
+}
+
+###############################################################################
+# 6 Auto Scaling Policies
+###############################################################################
+
+# ADDED: Policy to scale up the ASG by one instance.
+resource "aws_autoscaling_policy" "scale_up" {
+  name                   = "${var.name}-scale-up"
+  autoscaling_group_name = aws_autoscaling_group.monolith_asg.name
+  adjustment_type        = "ChangeInCapacity"
+  scaling_adjustment     = 1
+  cooldown               = 300 # 5 minutes
+}
+
+# ADDED: CloudWatch alarm to trigger the scale-up policy when CPU is >= 70% for 5 minutes.
+resource "aws_cloudwatch_metric_alarm" "scale_up_alarm" {
+  alarm_name          = "${var.name}-cpu-high-alarm"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = "1"
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = "300" # 5 minutes in seconds
+  statistic           = "Average"
+  threshold           = "70"
+
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.monolith_asg.name
+  }
+
+  alarm_description = "This metric monitors ec2 cpu utilization"
+  alarm_actions     = [aws_autoscaling_policy.scale_up.arn]
+}
+
+# ADDED: Policy to scale down the ASG by one instance.
+resource "aws_autoscaling_policy" "scale_down" {
+  name                   = "${var.name}-scale-down"
+  autoscaling_group_name = aws_autoscaling_group.monolith_asg.name
+  adjustment_type        = "ChangeInCapacity"
+  scaling_adjustment     = -1
+  cooldown               = 600 # 10 minutes
+}
+
+# ADDED: CloudWatch alarm to trigger the scale-down policy when CPU is <= 30% for 10 minutes.
+resource "aws_cloudwatch_metric_alarm" "scale_down_alarm" {
+  alarm_name          = "${var.name}-cpu-low-alarm"
+  comparison_operator = "LessThanOrEqualToThreshold"
+  evaluation_periods  = "1"
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = "600" # 10 minutes in seconds
+  statistic           = "Average"
+  threshold           = "30"
+
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.monolith_asg.name
+  }
+
+  alarm_description = "This metric monitors ec2 cpu utilization"
+  alarm_actions     = [aws_autoscaling_policy.scale_down.arn]
+}
+# modules/data_services/main.tf
+
+###############################################################################
+# 0 Security Group for Data Services
+###############################################################################
+resource "aws_security_group" "data_services_sg" {
+  name        = "${var.name}-data-sg"
+  description = "Allow Agentic ASG to access Qdrant on port 6333"
+  vpc_id      = var.vpc_id
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+###############################################################################
+# 1 Qdrant on EC2
+###############################################################################
+
+data "aws_ami" "ecs_optimized_arm" {
+  most_recent = true
+  owners      = ["amazon"]
+  filter {
+    name   = "name"
+    values = ["amzn2-ami-ecs-hvm-*-arm64-ebs"]
+  }
+}
+
+resource "aws_iam_role" "qdrant_ec2_role" {
+  name = "${var.name}-qdrant-ec2-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+      },
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "qdrant_ssm_policy" {
+  role       = aws_iam_role.qdrant_ec2_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_role_policy_attachment" "qdrant_ecr_pull_policy" {
+  role       = aws_iam_role.qdrant_ec2_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+}
+
+resource "aws_iam_instance_profile" "qdrant_ec2_profile" {
+  name = "${var.name}-qdrant-ec2-profile"
+  role = aws_iam_role.qdrant_ec2_role.name
+}
+
+resource "aws_instance" "qdrant" {
+  ami                  = data.aws_ami.ecs_optimized_arm.id
+  # FIXED: Use the new variable for the instance type.
+  instance_type        = var.qdrant_instance_type
+  subnet_id            = var.private_subnet_ids[0]
+  vpc_security_group_ids = [aws_security_group.data_services_sg.id]
+  iam_instance_profile = aws_iam_instance_profile.qdrant_ec2_profile.name
+
+  metadata_options {
+    http_tokens   = "required"
+    http_endpoint = "enabled"
+  }
+
+  root_block_device {
+    volume_size = 30
+  }
+
+  user_data = <<-EOF
+              #!/bin/bash
+              # Create Docker daemon configuration file
+              cat <<'EOT' > /etc/docker/daemon.json
+              {
+                "log-driver": "awslogs",
+                "log-opts": {
+                  "awslogs-group": "${var.name}-qdrant-ec2-logs",
+                  "awslogs-region": "${var.region}",
+                  "awslogs-create-group": "true"
+                }
+              }
+              EOT
+
+              # Restart Docker to apply the new configuration
+              systemctl restart docker
+
+              # Run Qdrant container, which will now log to CloudWatch automatically
+              mkdir -p /opt/qdrant/storage
+              docker run -d -p 6333:6333 -v /opt/qdrant/storage:/qdrant/storage qdrant/qdrant:latest
+              EOF
+
+  tags = {
+    Name = "${var.name}-qdrant-ec2"
+  }
+}
+
+###############################################################################
+# 2 Secrets Manager
+###############################################################################
+resource "random_pet" "secret_suffix" {
+  length = 2
+}
+
+resource "aws_secretsmanager_secret" "this" {
+  for_each                = var.secrets
+  name                    = "/myapp/${var.tenant_id}/${each.key}-${random_pet.secret_suffix.id}"
+  description             = "Auto-generated secret for ${each.key}"
+  recovery_window_in_days = 0
+}
+
+resource "aws_secretsmanager_secret_version" "this" {
+  for_each      = var.secrets
+  secret_id     = aws_secretsmanager_secret.this[each.key].id
+  secret_string = each.value
+}
+# envs/prod/main.tf
+
+module "vpc" {
+  source                   = "../../modules/vpc"
+  name                     = local.name_prefix
+  cidr                     = var.vpc_cidr
+  public_subnet_cidrs      = var.public_subnet_cidrs
+  private_app_subnet_cidrs = var.private_app_subnet_cidrs
+  private_rag_subnet_cidrs = var.private_rag_subnet_cidrs
+}
+/*
+module "ingress" {
+  source                  = "../../modules/ingress"
+  name                    = local.name_prefix
+  vpc_id                  = module.vpc.vpc_id
+  public_subnet_ids       = module.vpc.public_subnet_ids
+  alb_security_group_id   = module.vpc.alb_sg_id       # from your vpc module outputs
+  api_gateway_sg_id       = module.vpc.api_gw_sg_id    # if defined
+  domain_name             = "${var.tenant_id}.api.${var.project}.com"
+}
+*/
+module "monolith_asg" {
+  source                  = "../../modules/monolith_asg"
+  name                    = "${local.name_prefix}-web"
+  vpc_id                  = module.vpc.vpc_id
+  private_subnet_ids      = module.vpc.private_app_subnet_ids
+  instance_type           = var.web_instance_type
+  min_size                = var.web_min_size
+  max_size                = var.web_max_size
+  desired_capacity        = var.web_desired_capacity
+  #assets_bucket           = module.data_services.assets_bucket_name # if used in userdata
+  # Add missing variables required by the module
+  sqs_queue_arn              = module.rag_pipeline.queue_arn
+  secrets_manager_secret_arn = element(module.data_services.secrets_manager_secret_arns, 0)
+}
+
+module "agentic_asg" {
+  source                            = "../../modules/agentic_asg"
+  name                              = "${local.name_prefix}-agentic"
+  vpc_id                            = module.vpc.vpc_id
+  private_subnet_ids                = module.vpc.private_app_subnet_ids
+
+  allowed_source_security_group_ids = [
+    module.monolith_asg.security_group_id
+  ]
+
+  instance_type                     = var.agentic_instance_type
+  min_size                          = var.agentic_min_size
+  max_size                          = var.agentic_max_size
+  desired_capacity                  = var.agentic_desired_capacity
+
+  s3_bucket_name                    = module.data_services.bucket_name
+  sqs_queue_arn                     = module.rag_pipeline.queue_arn
+  sqs_queue_url                     = module.rag_pipeline.queue_url
+  secrets_manager_secret_arn        = module.data_services.secrets_manager_secret_arns[0]
+  region                            = var.region
+}
+
+module "data_services" {
+  source              = "../../modules/data_services"
+  name                = local.name_prefix
+  tenant_id           = var.tenant_id
+  vpc_id              = module.vpc.vpc_id
+  private_subnet_ids  = module.vpc.private_app_subnet_ids
+  region              = var.region
+
+  # example: pass initial secrets if you want auto-creation
+  secrets = {
+    "db_password" = "changeme123"
+  }
+}
+
+module "rag_pipeline" {
+  source                         = "../../modules/rag_pipeline"
+  name                           = local.name_prefix
+  tenant_id                      = var.tenant_id
+  region                         = var.region
+  private_subnet_ids             = module.vpc.private_rag_subnet_ids
+  vpc_id               = module.vpc.vpc_id  
+  chunk_lambda_s3_bucket         = var.chunk_lambda_s3_bucket
+  chunk_lambda_s3_key            = var.chunk_lambda_s3_key
+  embed_lambda_s3_bucket         = var.embed_lambda_s3_bucket
+  embed_lambda_s3_key            = var.embed_lambda_s3_key
+  index_lambda_s3_bucket         = var.index_lambda_s3_bucket
+  index_lambda_s3_key            = var.index_lambda_s3_key
+  secrets_manager_secret_arn     = element(module.data_services.secrets_manager_secret_arns, 0)
+}
+
+
+module "iam" {
+  source                  = "../../modules/iam"
+  # …any shared IAM roles or policies your other modules need…
+}
+/*
+module "monitoring" {
+  source                  = "../../modules/monitoring"
+  name                    = local.name_prefix
+  # …pass ARNs or names of your ASGs, ALB, Lambdas, etc., to hook up alarms…
+}
+*/
+resource "aws_security_group_rule" "agentic_to_data_redis" {
+  type                     = "ingress"
+  from_port                = 6379
+  to_port                  = 6379
+  protocol                 = "tcp"
+  source_security_group_id = module.agentic_asg.security_group_id
+  security_group_id        = module.data_services.data_services_security_group_id
+  description              = "Allow Agentic ASG to Redis"
+}
+
+resource "aws_security_group_rule" "agentic_to_data_qdrant" {
+  type                     = "ingress"
+  from_port                = 6333
+  to_port                  = 6333
+  protocol                 = "tcp"
+  source_security_group_id = module.agentic_asg.security_group_id
+  security_group_id        = module.data_services.data_services_security_group_id
+  description              = "Allow Agentic ASG to Qdrant"
+}# envs/dev/main.tf
+
+# Resource to create the S3 bucket for Lambda source code.
+resource "aws_s3_bucket" "lambda_code" {
+  bucket = var.lambda_code_bucket_name
+}
+
+# ADDED: A dedicated S3 bucket for the monolith's assets.
+resource "aws_s3_bucket" "monolith_assets" {
+  bucket = "${local.name_prefix}-monolith-assets"
+}
+
+# A data source to create a valid, empty zip file in memory.
+# This is used as a placeholder for the Lambda function code.
+data "archive_file" "dummy_lambda_zip" {
+  type        = "zip"
+  output_path = "${path.module}/dummy_lambda.zip"
+
+  source {
+    content  = "exports.handler = async (event) => {};"
+    filename = "index.js"
+  }
+}
+
+
+# Placeholder objects to simulate the upload of Lambda function code.
+resource "aws_s3_object" "chunk_lambda_code" {
+  bucket = aws_s3_bucket.lambda_code.id
+  key    = var.chunk_lambda_s3_key
+  source = data.archive_file.dummy_lambda_zip.output_path
+  etag   = filemd5(data.archive_file.dummy_lambda_zip.output_path)
+}
+
+resource "aws_s3_object" "embed_lambda_code" {
+  bucket = aws_s3_bucket.lambda_code.id
+  key    = var.embed_lambda_s3_key
+  source = data.archive_file.dummy_lambda_zip.output_path
+  etag   = filemd5(data.archive_file.dummy_lambda_zip.output_path)
+}
+
+resource "aws_s3_object" "index_lambda_code" {
+  bucket = aws_s3_bucket.lambda_code.id
+  key    = var.index_lambda_s3_key
+  source = data.archive_file.dummy_lambda_zip.output_path
+  etag   = filemd5(data.archive_file.dummy_lambda_zip.output_path)
+}
+
+
+module "vpc" {
+  source                   = "../../modules/vpc"
+  name                     = local.name_prefix
+  cidr                     = var.vpc_cidr
+  public_subnet_cidrs      = var.public_subnet_cidrs
+  private_app_subnet_cidrs = var.private_app_subnet_cidrs
+  private_rag_subnet_cidrs = var.private_rag_subnet_cidrs
+  region                   = var.region
+}
+
+module "monolith_asg" {
+  source                     = "../../modules/monolith_asg"
+  name                       = "${local.name_prefix}-web"
+  vpc_id                     = module.vpc.vpc_id
+  private_subnet_ids         = module.vpc.private_app_subnet_ids
+  instance_type              = var.web_instance_type
+  min_size                   = var.web_min_size
+  max_size                   = var.web_max_size
+  desired_capacity           = var.web_desired_capacity
+  # FIXED: Pass the name of the newly created assets bucket.
+  assets_bucket              = aws_s3_bucket.monolith_assets.bucket
+  sqs_queue_arn              = module.rag_pipeline.queue_arn
+  secrets_manager_secret_arn = module.data_services.secrets_manager_secret_arns_map["db_password"]
+  region                     = var.region
+  monolith_image_uri         = var.monolith_image_uri
+}
+
+module "agentic_asg" {
+  source                            = "../../modules/agentic_asg"
+  name                              = "${local.name_prefix}-agentic"
+  vpc_id                            = module.vpc.vpc_id
+  private_subnet_ids                = module.vpc.private_app_subnet_ids
+  allowed_source_security_group_ids = [module.monolith_asg.security_group_id]
+  instance_type                     = var.agentic_instance_type
+  min_size                          = var.agentic_min_size
+  max_size                          = var.agentic_max_size
+  desired_capacity                  = var.agentic_desired_capacity
+  s3_bucket_name                    = module.rag_pipeline.bucket_name
+  sqs_queue_url                     = module.rag_pipeline.queue_url
+  sqs_queue_arn                     = module.rag_pipeline.queue_arn
+  secrets_manager_secret_arn        = module.data_services.secrets_manager_secret_arns_map["db_password"]
+  region                            = var.region
+  agentic_image_uri                 = var.agentic_image_uri
+}
+
+module "data_services" {
+  source               = "../../modules/data_services"
+  name                 = local.name_prefix
+  tenant_id            = var.tenant_id
+  vpc_id               = module.vpc.vpc_id
+  private_subnet_ids   = module.vpc.private_app_subnet_ids
+  region               = var.region
+  qdrant_instance_type = var.qdrant_instance_type
+  secrets = {
+    "db_password"    = "changeme123"
+    "qdrant_api_key" = var.qdrant_api_key
+  }
+}
+
+module "rag_pipeline" {
+  source                 = "../../modules/rag_pipeline"
+  name                   = local.name_prefix
+  tenant_id              = var.tenant_id
+  region                 = var.region
+  private_subnet_ids     = module.vpc.private_rag_subnet_ids
+  vpc_id                 = module.vpc.vpc_id
+  chunk_lambda_s3_bucket = aws_s3_bucket.lambda_code.id
+  chunk_lambda_s3_key    = var.chunk_lambda_s3_key
+  embed_lambda_s3_bucket = aws_s3_bucket.lambda_code.id
+  embed_lambda_s3_key    = var.embed_lambda_s3_key
+  index_lambda_s3_bucket = aws_s3_bucket.lambda_code.id
+  index_lambda_s3_key    = var.index_lambda_s3_key
+
+  lambda_security_group_id  = module.vpc.rag_lambda_security_group_id
+  bedrock_embed_model_arn   = var.bedrock_embed_model_arn
+  qdrant_endpoint           = "http://${module.data_services.qdrant_instance_private_ip}:6333"
+  qdrant_api_key_secret_arn = module.data_services.secrets_manager_secret_arns_map["qdrant_api_key"]
+
+  depends_on = [
+    aws_s3_object.chunk_lambda_code,
+    aws_s3_object.embed_lambda_code,
+    aws_s3_object.index_lambda_code,
+  ]
+}
+
+
+module "iam" {
+  source                     = "../../modules/iam"
+  name                       = local.name_prefix
+  region                     = var.region
+  s3_bucket_name             = module.rag_pipeline.bucket_name
+  sqs_queue_arn              = module.rag_pipeline.queue_arn
+  secrets_manager_secret_arn = module.data_services.secrets_manager_secret_arns_map["db_password"]
+}
+
+resource "aws_security_group_rule" "agentic_to_data_qdrant" {
+  type                     = "ingress"
+  from_port                = 6333
+  to_port                  = 6333
+  protocol                 = "tcp"
+  source_security_group_id = module.agentic_asg.security_group_id
+  security_group_id        = module.data_services.data_services_security_group_id
+  description              = "Allow Agentic ASG to Qdrant"
+}
+# modules/agentic_asg/outputs.tf
+
+output "asg_name" {
+  description = "Name of the Agentic Auto Scaling Group"
+  value       = aws_autoscaling_group.agentic_asg.name
+}
+
+output "security_group_id" {
+  description = "Security Group ID for Agentic instances"
+  value       = aws_security_group.agentic_sg.id
+}
+
+# ADDED: Output for the new ECR repository URI.
+output "agentic_ecr_uri" {
+  description = "The URI of the ECR repository for the agentic container."
+  value       = aws_ecr_repository.agentic.repository_url
+}
+# modules/rag_pipeline/outputs.tf
+
+# FIXED: These outputs are now valid again after restoring the resources in main.tf
+output "bucket_name" {
+  description = "Name of S3 bucket for RAG storage"
+  value       = aws_s3_bucket.this.bucket
+}
+
+output "queue_url" {
+  description = "URL of main RAG SQS queue"
+  value       = aws_sqs_queue.main.id
+}
+
+output "queue_arn" {
+  description = "ARN of main RAG SQS queue"
+  value       = aws_sqs_queue.main.arn
+}
+
+output "dlq_arn" {
+  description = "ARN of dead-letter queue"
+  value       = aws_sqs_queue.dlq.arn
+}
+# modules/vpc/outputs.tf
+
+output "vpc_id" {
+  value = aws_vpc.this.id
+}
+
+output "public_subnet_ids" {
+  value = aws_subnet.public[*].id
+}
+
+output "private_app_subnet_ids" {
+  value = aws_subnet.private_app[*].id
+}
+
+output "private_rag_subnet_ids" {
+  value = aws_subnet.private_rag[*].id
+}
+
+# ADDED: Output for the RAG Lambda security group ID.
+output "rag_lambda_security_group_id" {
+  description = "The ID of the security group for the RAG pipeline Lambdas."
+  value       = aws_security_group.rag_lambda_sg.id
+}
+# modules/monolith_asg/outputs.tf
+
+output "asg_name" {
+  description = "Name of the Monolith Auto Scaling Group"
+  value       = aws_autoscaling_group.monolith_asg.name
+}
+
+output "security_group_id" {
+  description = "Security Group ID for Monolith instances"
+  value       = aws_security_group.monolith.id
+}
+
+# ADDED: Output for the new ECR repository URI.
+output "monolith_ecr_uri" {
+  description = "The URI of the ECR repository for the monolith container."
+  value       = aws_ecr_repository.monolith.repository_url
+}
+# modules/data_services/outputs.tf
+
+output "qdrant_instance_private_ip" {
+  description = "The private IP address of the Qdrant EC2 instance."
+  value       = aws_instance.qdrant.private_ip
+}
+
+output "secrets_manager_secret_arns" {
+  value       = [for s in aws_secretsmanager_secret.this : s.arn]
+  description = "ARNs of created Secrets"
+}
+
+# ADDED: A map of secret names to their ARNs for easier lookup.
+output "secrets_manager_secret_arns_map" {
+  value       = { for k, s in aws_secretsmanager_secret.this : k => s.arn }
+  description = "Map of secret names to their ARNs"
+}
+
+output "data_services_security_group_id" {
+  description = "Security Group for Redis & Qdrant"
+  value       = aws_security_group.data_services_sg.id
+}
+output "alb_dns"          { value = module.ingress.alb_dns_name }
+output "api_gateway_url"  { value = module.ingress.api_gateway_invoke_url }
+output "web_asg_name"     { value = module.monolith_asg.asg_name }
+output "rag_queue_url"    { value = module.rag_pipeline.queue_url }
+# envs/dev/outputs.tf
+
+# The 'ingress' module is commented out in main.tf, so these outputs are invalid.
+# output "alb_dns"          { value = module.ingress.alb_dns_name }
+# output "api_gateway_url"  { value = module.ingress.api_gateway_invoke_url }
+
+output "web_asg_name"  { value = module.monolith_asg.asg_name }
+output "rag_queue_url" { value = module.rag_pipeline.queue_url }
+provider "aws" {
+  region = var.region
+  default_tags {
+    tags = {
+      Project     = var.project
+      Environment = var.environment
+      Tenant      = var.tenant_id
+    }
+  }
+}
+# envs/dev/provider.tf
+provider "aws" {
+  region = var.region
+  default_tags {
+    tags = {
+      Project     = var.project
+      Environment = var.environment
+      Tenant      = var.tenant_id
+    }
+  }
+}
+# modules/agentic_asg/variables.tf
+
+variable "name" {
+  type = string
+}
+
+variable "vpc_id" {
+  type = string
+}
+
+variable "private_subnet_ids" {
+  type = list(string)
+}
+
+variable "allowed_source_security_group_ids" {
+  type = list(string)
+}
+
+variable "instance_type" {
+  type    = string
+  default = "t3.medium"
+}
+
+variable "min_size" {
+  type    = number
+  default = 1
+}
+
+variable "max_size" {
+  type    = number
+  default = 2
+}
+
+variable "desired_capacity" {
+  type    = number
+  default = 1
+}
+
+variable "s3_bucket_name" {
+  type = string
+}
+
+variable "sqs_queue_arn" {
+  type = string
+}
+
+variable "sqs_queue_url" {
+  type = string
+}
+
+variable "secrets_manager_secret_arn" {
+  type = string
+}
+
+variable "region" {
+  type    = string
+  default = "eu-central-1"
+}
+
+# ADDED: New variable to optionally specify the ECR image URI.
+variable "agentic_image_uri" {
+  description = "Optional full image URI for the agentic container to pull and run. If empty, no container will be launched."
+  type        = string
+  default     = ""
+}
+variable "name" {
+  description = "Prefix (project-env-tenant) for all RAG resources"
+  type        = string
+}
+
+variable "tenant_id" {
+  description = "Tenant identifier (passed to Lambdas)"
+  type        = string
+}
+
+variable "region" {
+  description = "AWS Region"
+  type        = string
+  default     = "eu-central-1"
+}
+
+variable "vpc_id" {
+  description = "VPC ID for RAG Lambdas"
+  type        = string
+}
+
+variable "private_subnet_ids" {
+  description = "Subnets for VPC-enabled Lambdas"
+  type        = list(string)
+}
+
+# Lambda code locations
+variable "chunk_lambda_s3_bucket" {
+  type = string
+}
+
+variable "chunk_lambda_s3_key" {
+  type = string
+}
+
+variable "embed_lambda_s3_bucket" {
+  type = string
+}
+
+variable "embed_lambda_s3_key" {
+  type = string
+}
+
+variable "index_lambda_s3_bucket" {
+  type = string
+}
+
+variable "index_lambda_s3_key" {
+  type = string
+}
+
+variable "lambda_runtime" {
+  type    = string
+  default = "python3.9"
+}
+
+variable "secrets_manager_secret_arn" {
+  description = "ARN of a generic Secrets Manager secret Lambda can read"
+  type        = string
+  default     = null
+}
+
+variable "lambda_security_group_id" {
+  description = "The security group ID to assign to the VPC-enabled Lambdas."
+  type        = string
+}
+
+variable "bedrock_embed_model_arn" {
+  description = "The ARN of the Bedrock model to use for embeddings."
+  type        = string
+}
+
+variable "qdrant_endpoint" {
+  description = "The network endpoint for the Qdrant vector database."
+  type        = string
+}
+
+variable "qdrant_api_key_secret_arn" {
+  description = "The ARN of the Secrets Manager secret containing the Qdrant API key."
+  type        = string
+}
+variable "name" {
+  type = string
+}
+
+variable "cidr" {
+  type = string
+}
+
+variable "public_subnet_cidrs" {
+  type = list(string)
+}
+
+variable "private_app_subnet_cidrs" {
+  type = list(string)
+}
+
+variable "private_rag_subnet_cidrs" {
+  type = list(string)
+}
+
+# ADDED: This variable was used in main.tf for endpoints but was not declared.
+variable "region" {
+  description = "The AWS region to create VPC endpoints in."
+  type        = string
+}
+# modules/iam/variables.tf
+
+# ADDED: These variables were being used but were not declared.
+variable "name" {
+  description = "A name prefix for the IAM resources."
+  type        = string
+}
+
+variable "s3_bucket_name" {
+  description = "The name of the S3 bucket for which to grant permissions."
+  type        = string
+}
+
+variable "sqs_queue_arn" {
+  description = "The ARN of the SQS queue for which to grant permissions."
+  type        = string
+}
+
+variable "secrets_manager_secret_arn" {
+  description = "The ARN of the Secrets Manager secret to grant access to."
+  type        = string
+}
+
+variable "region" {
+  description = "The AWS region where resources are deployed."
+  type        = string
+}
+# modules/monolith_asg/variables.tf
+
+variable "name" {
+  type = string
+}
+
+variable "vpc_id" {
+  type = string
+}
+
+variable "private_subnet_ids" {
+  type = list(string)
+}
+
+variable "instance_type" {
+  type = string
+}
+
+variable "min_size" {
+  type = number
+}
+
+variable "max_size" {
+  type = number
+}
+
+variable "desired_capacity" {
+  type = number
+}
+
+variable "assets_bucket" {
+  type = string
+}
+
+variable "sqs_queue_arn" {
+  type = string
+}
+
+variable "secrets_manager_secret_arn" {
+  type = string
+}
+
+variable "region" {
+  type    = string
+  default = "eu-central-1"
+}
+
+# ADDED: New variable to optionally specify the ECR image URI for the monolith.
+variable "monolith_image_uri" {
+  description = "Optional full image URI for the monolith container to pull and run. If empty, no container will be launched."
+  type        = string
+  default     = ""
+}
+# modules/data_services/variables.tf
+
+variable "name" {
+  description = "Prefix (project-env-tenant) for data services"
+  type        = string
+}
+
+variable "tenant_id" {
+  description = "Tenant identifier"
+  type        = string
+}
+
+variable "vpc_id" {
+  description = "VPC ID"
+  type        = string
+}
+
+variable "private_subnet_ids" {
+  description = "Subnets for ElastiCache & ECS"
+  type        = list(string)
+}
+
+variable "region" {
+  description = "AWS Region"
+  type        = string
+  default     = "us-east-1"
+}
+
+# ADDED: Variable for the Qdrant instance type.
+variable "qdrant_instance_type" {
+  description = "Instance type for the Qdrant EC2 instance."
+  type        = string
+  default     = "t4g.small"
+}
+
+variable "qdrant_container_image" {
+  description = "Docker image for Qdrant"
+  type        = string
+  default     = "qdrant/qdrant:latest"
+}
+
+variable "secrets" {
+  description = "Map of secret names ⇒ initial values (optional)"
+  type        = map(string)
+  default     = {}
+}
+# envs/prod/variables.tf
+
+variable "project" {
+  type    = string
+  default = "myapp"
+}
+
+variable "environment" {
+  type    = string
+  default = "prod"
+}
+
+variable "tenant_id" {
+  type    = string
+  default = "T001"
+}
+
+variable "region" {
+  type    = string
+  default = "eu-central-1"
+}
+
+# VPC
+variable "vpc_cidr" {
+  type    = string
+  default = "10.0.0.0/16"
+}
+
+variable "public_subnet_cidrs" {
+  type    = list(string)
+  default = ["10.0.1.0/24", "10.0.2.0/24"]
+}
+
+variable "private_app_subnet_cidrs" {
+  type    = list(string)
+  default = ["10.0.11.0/24", "10.0.12.0/24"]
+}
+
+variable "private_rag_subnet_cidrs" {
+  type    = list(string)
+  default = ["10.0.21.0/24", "10.0.22.0/24"]
+}
+
+# NAT scheduling (optional tweak)
+variable "nat_on_time" {
+  type    = string
+  default = "cron(0 7 * * ? *)"
+}
+
+variable "nat_off_time" {
+  type    = string
+  default = "cron(0 19 * * ? *)"
+}
+
+# Web ASG sizing
+variable "web_instance_type" {
+  type    = string
+  default = "t3.medium"
+}
+
+variable "web_min_size" {
+  type    = number
+  default = 1
+}
+
+variable "web_max_size" {
+  type    = number
+  default = 2
+}
+
+variable "web_desired_capacity" {
+  type    = number
+  default = 1
+}
+
+# RAG code locations
+variable "chunk_lambda_s3_bucket" {
+  type    = string
+  default = "myapp-lambda-code"
+}
+
+variable "chunk_lambda_s3_key" {
+  type    = string
+  default = "chunk.zip"
+}
+
+variable "embed_lambda_s3_bucket" {
+  type    = string
+  default = "myapp-lambda-code"
+}
+
+variable "embed_lambda_s3_key" {
+  type    = string
+  default = "embed.zip"
+}
+
+variable "index_lambda_s3_bucket" {
+  type    = string
+  default = "myapp-lambda-code"
+}
+
+variable "index_lambda_s3_key" {
+  type    = string
+  default = "index.zip"
+}
+
+# Agentic ASG sizing
+variable "agentic_instance_type" {
+  type    = string
+  default = "t3.medium"
+}
+
+variable "agentic_min_size" {
+  type    = number
+  default = 1
+}
+
+variable "agentic_max_size" {
+  type    = number
+  default = 2
+}
+
+variable "agentic_desired_capacity" {
+  type    = number
+  default = 1
+}
+# envs/dev/variables.tf
+
+variable "project" {
+  type    = string
+  default = "myapp"
+}
+
+variable "environment" {
+  type    = string
+  default = "dev"
+}
+
+variable "tenant_id" {
+  type    = string
+  default = "T001"
+}
+
+variable "region" {
+  type    = string
+  default = "eu-central-1"
+}
+
+# VPC
+variable "vpc_cidr" {
+  type    = string
+  default = "10.0.0.0/16"
+}
+
+variable "public_subnet_cidrs" {
+  type    = list(string)
+  default = ["10.0.1.0/24", "10.0.2.0/24"]
+}
+
+variable "private_app_subnet_cidrs" {
+  type    = list(string)
+  default = ["10.0.11.0/24", "10.0.12.0/24"]
+}
+
+variable "private_rag_subnet_cidrs" {
+  type    = list(string)
+  default = ["10.0.21.0/24", "10.0.22.0/24"]
+}
+
+# Web ASG sizing
+variable "web_instance_type" {
+  description = "Instance type for the monolith web server."
+  type        = string
+  default     = "t4g.micro"
+}
+
+variable "web_min_size" {
+  type    = number
+  default = 1
+}
+
+variable "web_max_size" {
+  type    = number
+  default = 2
+}
+
+variable "web_desired_capacity" {
+  type    = number
+  default = 1
+}
+
+# RAG code locations
+variable "lambda_code_bucket_name" {
+  description = "The name of the S3 bucket for Lambda function code."
+  type        = string
+  default     = "myapp-lambda-code-dev"
+}
+
+variable "chunk_lambda_s3_key" {
+  type    = string
+  default = "chunk.zip"
+}
+
+variable "embed_lambda_s3_key" {
+  type    = string
+  default = "embed.zip"
+}
+
+variable "index_lambda_s3_key" {
+  type    = string
+  default = "index.zip"
+}
+
+# Agentic ASG sizing
+variable "agentic_instance_type" {
+  description = "Instance type for the agentic logic server."
+  type        = string
+  default     = "t4g.micro"
+}
+
+variable "agentic_min_size" {
+  type    = number
+  default = 1
+}
+
+variable "agentic_max_size" {
+  type    = number
+  default = 2
+}
+
+variable "agentic_desired_capacity" {
+  type    = number
+  default = 1
+}
+
+# ADDED: New variable for Qdrant instance type
+variable "qdrant_instance_type" {
+  description = "Instance type for the Qdrant EC2 instance."
+  type        = string
+  default     = "t4g.micro"
+}
+
+variable "monolith_image_uri" {
+  description = "Optional: The full URI of the monolith Docker image in ECR. Leave empty to skip."
+  type        = string
+  default     = ""
+}
+
+variable "agentic_image_uri" {
+  description = "Optional: The full URI of the agentic Docker image in ECR. Leave empty to skip."
+  type        = string
+  default     = ""
+}
+
+variable "bedrock_embed_model_arn" {
+  description = "The ARN of the Bedrock model to use for embeddings."
+  type        = string
+  default     = "arn:aws:bedrock:eu-central-1::foundation-model/amazon.titan-embed-text-v1"
+}
+
+variable "qdrant_api_key" {
+  description = "The API key for the Qdrant vector database."
+  type        = string
+  sensitive   = true
+  default     = "please-change-this-insecure-default-key"
+}
