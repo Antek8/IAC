@@ -1,4 +1,3 @@
-# modules/vpc/variables.tf
 
 variable "name" {
   type = string

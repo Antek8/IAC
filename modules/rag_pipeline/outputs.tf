@@ -1,5 +1,6 @@
 # modules/rag_pipeline/outputs.tf
 
+# FIXED: These outputs are now valid again after restoring the resources in main.tf
 output "bucket_name" {
   description = "Name of S3 bucket for RAG storage"
   value       = aws_s3_bucket.this.bucket

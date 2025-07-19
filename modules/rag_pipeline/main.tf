@@ -1,27 +1,11 @@
 # modules/rag_pipeline/main.tf
 
 ###############################################################################
-# 0 Security Group for RAG Lambdas
+# 1. S3 Bucket & SQS Queues
 ###############################################################################
-resource "aws_security_group" "rag_lambda_sg" {
-  name        = "${var.name}-lambda-sg"
-  description = "No inbound; full egress so Lambdas can reach S3, SQS, Bedrock, etc."
-  vpc_id      = var.vpc_id
 
-  # No ingress blocks
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-}
-
-# 1 S3 bucket for chunk storage
 resource "aws_s3_bucket" "this" {
   bucket = "${var.name}-rag-chuncky"
-  # acl has been deprecated and is now managed by aws_s3_bucket_ownership_controls
 }
 
 resource "aws_s3_bucket_ownership_controls" "this" {
@@ -30,22 +14,17 @@ resource "aws_s3_bucket_ownership_controls" "this" {
     object_ownership = "BucketOwnerPreferred"
   }
 }
-
 resource "aws_s3_bucket_acl" "this" {
   depends_on = [aws_s3_bucket_ownership_controls.this]
   bucket     = aws_s3_bucket.this.id
   acl        = "private"
 }
-
-
 resource "aws_s3_bucket_versioning" "this" {
   bucket = aws_s3_bucket.this.id
   versioning_configuration {
     status = "Enabled"
   }
 }
-
-# DEPRECATED 'server_side_encryption_configuration' is replaced by this resource
 resource "aws_s3_bucket_server_side_encryption_configuration" "this" {
   bucket = aws_s3_bucket.this.id
   rule {
@@ -55,7 +34,7 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "this" {
   }
 }
 
-# 2 SQS + DLQ
+
 resource "aws_sqs_queue" "dlq" {
   name                      = "${var.name}-rag-dlq"
   message_retention_seconds = 1209600 # 14 days
@@ -71,7 +50,220 @@ resource "aws_sqs_queue" "main" {
   })
 }
 
-# 3 IAM for Lambdas
+###############################################################################
+# 2. Chunk-Splitter Lambda
+###############################################################################
+
+resource "aws_iam_role" "chunk_lambda_role" {
+  name               = "${var.name}-chunk-lambda-role"
+  assume_role_policy = data.aws_iam_policy_document.assume_lambda.json
+}
+
+resource "aws_iam_role_policy_attachment" "chunk_vpc_access" {
+  role       = aws_iam_role.chunk_lambda_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+}
+
+resource "aws_iam_role_policy" "chunk_lambda_policy" {
+  name   = "${var.name}-chunk-lambda-policy"
+  role   = aws_iam_role.chunk_lambda_role.id
+  policy = jsonencode({
+    Version   = "2012-10-17",
+    Statement = [
+      {
+        Sid    = "S3GetObject",
+        Effect = "Allow",
+        Action = "s3:GetObject",
+        Resource = "${aws_s3_bucket.this.arn}/*"
+      },
+      {
+        Sid    = "SQSSendMessage",
+        Effect = "Allow",
+        Action = "sqs:SendMessage",
+        Resource = aws_sqs_queue.main.arn
+      }
+    ]
+  })
+}
+
+resource "aws_cloudwatch_log_group" "chunk_lambda_logs" {
+  name              = "/aws/lambda/${var.name}-chunk"
+  retention_in_days = 7
+}
+
+resource "aws_lambda_function" "chunk" {
+  function_name    = "${var.name}-chunk"
+  s3_bucket        = var.chunk_lambda_s3_bucket
+  s3_key           = var.chunk_lambda_s3_key
+  handler          = "chunk.lambda_handler"
+  runtime          = var.lambda_runtime
+  role             = aws_iam_role.chunk_lambda_role.arn
+  timeout          = 15
+  memory_size      = 256
+
+  vpc_config {
+    subnet_ids         = var.private_subnet_ids
+    security_group_ids = [var.lambda_security_group_id]
+  }
+
+  environment {
+    variables = {
+      SOURCE_BUCKET   = aws_s3_bucket.this.id
+      CHUNK_QUEUE_URL = aws_sqs_queue.main.id
+      CHUNK_SIZE      = "1024" # Example value
+    }
+  }
+
+  tracing_config {
+    mode = "Active" # Enable X-Ray Tracing as requested
+  }
+
+  depends_on = [aws_cloudwatch_log_group.chunk_lambda_logs]
+}
+
+
+###############################################################################
+# 3. Embedding Lambda
+###############################################################################
+
+resource "aws_iam_role" "embed_lambda_role" {
+  name               = "${var.name}-embed-lambda-role"
+  assume_role_policy = data.aws_iam_policy_document.assume_lambda.json
+}
+
+resource "aws_iam_role_policy_attachment" "embed_vpc_access" {
+  role       = aws_iam_role.embed_lambda_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+}
+
+resource "aws_iam_role_policy" "embed_lambda_policy" {
+  name   = "${var.name}-embed-lambda-policy"
+  role   = aws_iam_role.embed_lambda_role.id
+  policy = jsonencode({
+    Version   = "2012-10-17",
+    Statement = [
+      {
+        Sid      = "BedrockInvoke",
+        Effect   = "Allow",
+        Action   = "bedrock:InvokeModel",
+        Resource = var.bedrock_embed_model_arn
+      },
+      {
+        Sid      = "S3Access",
+        Effect   = "Allow",
+        Action   = ["s3:GetObject", "s3:PutObject"],
+        Resource = "${aws_s3_bucket.this.arn}/*"
+      },
+      {
+        Sid      = "SQSRead",
+        Effect   = "Allow",
+        Action   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"],
+        Resource = aws_sqs_queue.main.arn
+      }
+    ]
+  })
+}
+
+resource "aws_cloudwatch_log_group" "embed_lambda_logs" {
+  name              = "/aws/lambda/${var.name}-embed"
+  retention_in_days = 7
+}
+
+resource "aws_lambda_function" "embed" {
+  function_name    = "${var.name}-embed"
+  s3_bucket        = var.embed_lambda_s3_bucket
+  s3_key           = var.embed_lambda_s3_key
+  handler          = "embed_processor.lambda_handler"
+  runtime          = var.lambda_runtime
+  role             = aws_iam_role.embed_lambda_role.arn
+  timeout          = 30
+  memory_size      = 512
+
+  vpc_config {
+    subnet_ids         = var.private_subnet_ids
+    security_group_ids = [var.lambda_security_group_id]
+  }
+
+  environment {
+    variables = {
+      EMBED_BUCKET            = aws_s3_bucket.this.id
+      BEDROCK_EMBED_MODEL_ARN = var.bedrock_embed_model_arn
+    }
+  }
+
+  tracing_config {
+    mode = "PassThrough"
+  }
+
+  depends_on = [aws_cloudwatch_log_group.embed_lambda_logs]
+}
+
+
+###############################################################################
+# 4. Indexer Lambda
+###############################################################################
+
+resource "aws_iam_role" "index_lambda_role" {
+  name               = "${var.name}-index-lambda-role"
+  assume_role_policy = data.aws_iam_policy_document.assume_lambda.json
+}
+
+resource "aws_iam_role_policy_attachment" "index_vpc_access" {
+  role       = aws_iam_role.index_lambda_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+}
+
+resource "aws_iam_role_policy" "index_secrets_policy" {
+  name = "${var.name}-index-secrets-policy"
+  role = aws_iam_role.index_lambda_role.id
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Sid    = "AllowSecrets",
+        Effect = "Allow",
+        Action = "secretsmanager:GetSecretValue",
+        Resource = var.qdrant_api_key_secret_arn
+      }
+    ]
+  })
+}
+
+resource "aws_cloudwatch_log_group" "index_lambda_logs" {
+  name              = "/aws/lambda/${var.name}-index"
+  retention_in_days = 7
+}
+
+resource "aws_lambda_function" "index" {
+  function_name    = "${var.name}-index"
+  s3_bucket        = var.index_lambda_s3_bucket
+  s3_key           = var.index_lambda_s3_key
+  handler          = "index_lambda.lambda_handler"
+  runtime          = var.lambda_runtime
+  role             = aws_iam_role.index_lambda_role.arn
+  timeout          = 15
+  memory_size      = 256
+
+  vpc_config {
+    subnet_ids         = var.private_subnet_ids
+    security_group_ids = [var.lambda_security_group_id]
+  }
+
+  environment {
+    variables = {
+      QDRANT_ENDPOINT    = var.qdrant_endpoint
+      API_KEY_SECRET_ARN = var.qdrant_api_key_secret_arn
+    }
+  }
+
+  tracing_config {
+    mode = "PassThrough"
+  }
+
+  depends_on = [aws_cloudwatch_log_group.index_lambda_logs]
+}
+
+# Common data source used by all Lambda roles
 data "aws_iam_policy_document" "assume_lambda" {
   statement {
     actions = ["sts:AssumeRole"]
@@ -79,137 +271,5 @@ data "aws_iam_policy_document" "assume_lambda" {
       type        = "Service"
       identifiers = ["lambda.amazonaws.com"]
     }
-  }
-}
-
-resource "aws_iam_role" "lambda" {
-  name               = "${var.name}-rag-lambda-role"
-  assume_role_policy = data.aws_iam_policy_document.assume_lambda.json
-}
-
-data "aws_iam_policy_document" "lambda_policy" {
-  statement {
-    sid       = "AllowS3"
-    actions   = ["s3:GetObject", "s3:PutObject", "s3:ListBucket"]
-    resources = [aws_s3_bucket.this.arn, "${aws_s3_bucket.this.arn}/*"]
-  }
-  statement {
-    sid       = "AllowSQS"
-    actions   = ["sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
-    resources = [aws_sqs_queue.main.arn]
-  }
-  statement {
-    sid       = "AllowSecrets"
-    actions   = ["secretsmanager:GetSecretValue"]
-    resources = [var.secrets_manager_secret_arn]
-  }
-  statement {
-    sid       = "AllowLogs"
-    actions   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
-    resources = ["arn:aws:logs:${var.region}:*:log-group:/aws/lambda/${var.name}-*"]
-  }
-  statement {
-    sid       = "AllowXRay"
-    actions   = ["xray:PutTraceSegments", "xray:PutTelemetryRecords"]
-    resources = ["*"]
-  }
-  # Add VPC permissions for Lambda
-  statement {
-    sid = "AllowVPC"
-    actions = [
-      "ec2:CreateNetworkInterface",
-      "ec2:DescribeNetworkInterfaces",
-      "ec2:DeleteNetworkInterface"
-    ]
-    resources = ["*"]
-  }
-}
-
-resource "aws_iam_role_policy" "lambda_policy" {
-  name   = "${var.name}-rag-lambda-policy"
-  # CORRECTED: The role was named 'lambda', not 'lambda_role'
-  role   = aws_iam_role.lambda.id
-  policy = data.aws_iam_policy_document.lambda_policy.json
-}
-
-# 5 Define each Lambda
-resource "aws_lambda_function" "chunk" {
-  function_name = "${var.name}-chunk"
-  s3_bucket     = var.chunk_lambda_s3_bucket
-  s3_key        = var.chunk_lambda_s3_key
-  handler       = "chunk.lambda_handler"
-  runtime       = var.lambda_runtime
-  role          = aws_iam_role.lambda.arn
-  memory_size   = var.lambda_memory_size
-  timeout       = var.lambda_timeout
-
-  vpc_config {
-    subnet_ids         = var.private_subnet_ids
-    security_group_ids = [aws_security_group.rag_lambda_sg.id]
-  }
-
-  environment {
-    variables = {
-      BUCKET    = aws_s3_bucket.this.bucket
-      QUEUE_URL = aws_sqs_queue.main.id
-      TENANT_ID = var.tenant_id
-    }
-  }
-
-  tracing_config {
-    mode = "Active"
-  }
-}
-
-resource "aws_lambda_function" "embed" {
-  function_name = "${var.name}-embed"
-  s3_bucket     = var.embed_lambda_s3_bucket
-  s3_key        = var.embed_lambda_s3_key
-  handler       = "embed_processor.lambda_handler"
-  runtime       = var.lambda_runtime
-  role          = aws_iam_role.lambda.arn
-  memory_size   = var.lambda_memory_size
-  timeout       = var.lambda_timeout
-
-  vpc_config {
-    subnet_ids         = var.private_subnet_ids
-    security_group_ids = [aws_security_group.rag_lambda_sg.id]
-  }
-
-  environment {
-    variables = {
-      QUEUE_URL = aws_sqs_queue.main.id
-      TENANT_ID = var.tenant_id
-    }
-  }
-
-  tracing_config {
-    mode = "Active"
-  }
-}
-
-resource "aws_lambda_function" "index" {
-  function_name = "${var.name}-index"
-  s3_bucket     = var.index_lambda_s3_bucket
-  s3_key        = var.index_lambda_s3_key
-  handler       = "index_lambda.lambda_handler"
-  runtime       = var.lambda_runtime
-  role          = aws_iam_role.lambda.arn
-  memory_size   = var.lambda_memory_size
-  timeout       = var.lambda_timeout
-
-  vpc_config {
-    subnet_ids         = var.private_subnet_ids
-    security_group_ids = [aws_security_group.rag_lambda_sg.id]
-  }
-
-  environment {
-    variables = {
-      TENANT_ID = var.tenant_id
-    }
-  }
-
-  tracing_config {
-    mode = "Active"
   }
 }

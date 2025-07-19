@@ -1,5 +1,3 @@
-# modules/rag_pipeline/variables.tf
-
 variable "name" {
   description = "Prefix (project-env-tenant) for all RAG resources"
   type        = string
@@ -56,17 +54,28 @@ variable "lambda_runtime" {
   default = "python3.9"
 }
 
-variable "lambda_memory_size" {
-  type    = number
-  default = 512
-}
-
-variable "lambda_timeout" {
-  type    = number
-  default = 60
-}
-
 variable "secrets_manager_secret_arn" {
-  description = "ARN of Secrets Manager secret Lambda will read"
+  description = "ARN of a generic Secrets Manager secret Lambda can read"
+  type        = string
+  default     = null
+}
+
+variable "lambda_security_group_id" {
+  description = "The security group ID to assign to the VPC-enabled Lambdas."
+  type        = string
+}
+
+variable "bedrock_embed_model_arn" {
+  description = "The ARN of the Bedrock model to use for embeddings."
+  type        = string
+}
+
+variable "qdrant_endpoint" {
+  description = "The network endpoint for the Qdrant vector database."
+  type        = string
+}
+
+variable "qdrant_api_key_secret_arn" {
+  description = "The ARN of the Secrets Manager secret containing the Qdrant API key."
   type        = string
 }

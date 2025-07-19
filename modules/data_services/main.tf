@@ -1,11 +1,11 @@
 # modules/data_services/main.tf
 
 ###############################################################################
-# 0 Security Group for Data Services (Redis & Qdrant)
+# 0 Security Group for Data Services
 ###############################################################################
 resource "aws_security_group" "data_services_sg" {
   name        = "${var.name}-data-sg"
-  description = "Allow Agentic ASG to access Redis(6379) & Qdrant(6333)"
+  description = "Allow Agentic ASG to access Qdrant on port 6333"
   vpc_id      = var.vpc_id
 
   egress {
@@ -16,108 +16,106 @@ resource "aws_security_group" "data_services_sg" {
   }
 }
 
-# 1 Redis Subnet Group & Replication Group
-resource "aws_elasticache_subnet_group" "redis" {
-  name       = "${var.name}-redis-subnet-group"
-  subnet_ids = var.private_subnet_ids
-}
+###############################################################################
+# 1 Qdrant on EC2
+###############################################################################
 
-resource "aws_elasticache_replication_group" "redis" {
-  replication_group_id = "${var.name}-redis"
-  description          = "Redis for ${var.name}"
-  node_type            = var.redis_node_type
-  num_cache_clusters   = var.redis_num_clusters
-  # FIXED: Set automatic failover dynamically based on the number of clusters.
-  # This requires at least 2 clusters.
-  automatic_failover_enabled = var.redis_num_clusters > 1
-  subnet_group_name          = aws_elasticache_subnet_group.redis.name
-  security_group_ids         = [aws_security_group.data_services_sg.id]
-  at_rest_encryption_enabled = true
-  transit_encryption_enabled = true
-}
-
-# 2 ECS cluster (for Qdrant)
-resource "aws_ecs_cluster" "qdrant" {
-  name = "${var.name}-qdrant-cluster"
-}
-
-# 3 ECR repo (optional) & ECS task/service
-resource "aws_ecr_repository" "qdrant" {
-  name                 = "${var.name}-qdrant-repo"
-  image_tag_mutability = "MUTABLE"
-}
-
-data "aws_iam_policy_document" "ecs_exec_assume_role" {
-  statement {
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["ecs-tasks.amazonaws.com"]
-    }
+data "aws_ami" "ecs_optimized_arm" {
+  most_recent = true
+  owners      = ["amazon"]
+  filter {
+    name   = "name"
+    values = ["amzn2-ami-ecs-hvm-*-arm64-ebs"]
   }
 }
 
-resource "aws_iam_role" "ecs_exec_role" {
-  name               = "${var.name}-ecs-exec-role"
-  assume_role_policy = data.aws_iam_policy_document.ecs_exec_assume_role.json
+resource "aws_iam_role" "qdrant_ec2_role" {
+  name = "${var.name}-qdrant-ec2-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+      },
+    ]
+  })
 }
 
-resource "aws_iam_role_policy_attachment" "ecs_exec_policy" {
-  role       = aws_iam_role.ecs_exec_role.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+resource "aws_iam_role_policy_attachment" "qdrant_ssm_policy" {
+  role       = aws_iam_role.qdrant_ec2_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-resource "aws_cloudwatch_log_group" "qdrant" {
-  name = "/ecs/${var.name}-qdrant"
+resource "aws_iam_role_policy_attachment" "qdrant_ecr_pull_policy" {
+  role       = aws_iam_role.qdrant_ec2_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
 }
 
-
-resource "aws_ecs_task_definition" "qdrant" {
-  family                   = "${var.name}-qdrant"
-  network_mode             = "awsvpc"
-  requires_compatibilities = ["FARGATE"]
-  cpu                      = "512"
-  memory                   = "1024"
-  execution_role_arn       = aws_iam_role.ecs_exec_role.arn
-
-  container_definitions = jsonencode([{
-    name      = "qdrant"
-    image     = var.qdrant_container_image
-    essential = true
-    portMappings = [{
-      containerPort = 6333
-      hostPort      = 6333
-      protocol      = "tcp"
-    }]
-    logConfiguration = {
-      logDriver = "awslogs"
-      options = {
-        "awslogs-group"         = aws_cloudwatch_log_group.qdrant.name
-        "awslogs-region"        = var.region
-        "awslogs-stream-prefix" = "ecs"
-      }
-    }
-  }])
+resource "aws_iam_instance_profile" "qdrant_ec2_profile" {
+  name = "${var.name}-qdrant-ec2-profile"
+  role = aws_iam_role.qdrant_ec2_role.name
 }
 
-resource "aws_ecs_service" "qdrant" {
-  name            = "${var.name}-qdrant-svc"
-  cluster         = aws_ecs_cluster.qdrant.id
-  task_definition = aws_ecs_task_definition.qdrant.arn
-  desired_count   = 1
-  launch_type     = "FARGATE"
+resource "aws_instance" "qdrant" {
+  ami                  = data.aws_ami.ecs_optimized_arm.id
+  # FIXED: Use the new variable for the instance type.
+  instance_type        = var.qdrant_instance_type
+  subnet_id            = var.private_subnet_ids[0]
+  vpc_security_group_ids = [aws_security_group.data_services_sg.id]
+  iam_instance_profile = aws_iam_instance_profile.qdrant_ec2_profile.name
 
-  network_configuration {
-    subnets         = var.private_subnet_ids
-    security_groups = [aws_security_group.data_services_sg.id]
+  metadata_options {
+    http_tokens   = "required"
+    http_endpoint = "enabled"
+  }
+
+  root_block_device {
+    volume_size = 30
+  }
+
+  user_data = <<-EOF
+              #!/bin/bash
+              # Create Docker daemon configuration file
+              cat <<'EOT' > /etc/docker/daemon.json
+              {
+                "log-driver": "awslogs",
+                "log-opts": {
+                  "awslogs-group": "${var.name}-qdrant-ec2-logs",
+                  "awslogs-region": "${var.region}",
+                  "awslogs-create-group": "true"
+                }
+              }
+              EOT
+
+              # Restart Docker to apply the new configuration
+              systemctl restart docker
+
+              # Run Qdrant container, which will now log to CloudWatch automatically
+              mkdir -p /opt/qdrant/storage
+              docker run -d -p 6333:6333 -v /opt/qdrant/storage:/qdrant/storage qdrant/qdrant:latest
+              EOF
+
+  tags = {
+    Name = "${var.name}-qdrant-ec2"
   }
 }
 
-# 4 Secrets Manager (optional keys)
+###############################################################################
+# 2 Secrets Manager
+###############################################################################
+resource "random_pet" "secret_suffix" {
+  length = 2
+}
+
 resource "aws_secretsmanager_secret" "this" {
-  for_each    = var.secrets
-  name        = "/myapp/${var.tenant_id}/${each.key}"
-  description = "Auto-generated secret for ${each.key}"
+  for_each                = var.secrets
+  name                    = "/myapp/${var.tenant_id}/${each.key}-${random_pet.secret_suffix.id}"
+  description             = "Auto-generated secret for ${each.key}"
+  recovery_window_in_days = 0
 }
 
 resource "aws_secretsmanager_secret_version" "this" {

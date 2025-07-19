@@ -7,7 +7,7 @@ variable "project" {
 
 variable "environment" {
   type    = string
-  default = "prod"
+  default = "dev"
 }
 
 variable "tenant_id" {
@@ -41,21 +41,11 @@ variable "private_rag_subnet_cidrs" {
   default = ["10.0.21.0/24", "10.0.22.0/24"]
 }
 
-# NAT scheduling (optional tweak)
-variable "nat_on_time" {
-  type    = string
-  default = "cron(0 7 * * ? *)"
-}
-
-variable "nat_off_time" {
-  type    = string
-  default = "cron(0 19 * * ? *)"
-}
-
 # Web ASG sizing
 variable "web_instance_type" {
-  type    = string
-  default = "t3.medium"
+  description = "Instance type for the monolith web server."
+  type        = string
+  default     = "t4g.micro"
 }
 
 variable "web_min_size" {
@@ -74,9 +64,10 @@ variable "web_desired_capacity" {
 }
 
 # RAG code locations
-variable "chunk_lambda_s3_bucket-kane" {
-  type    = string
-  default = "myapp-lambda-code"
+variable "lambda_code_bucket_name" {
+  description = "The name of the S3 bucket for Lambda function code."
+  type        = string
+  default     = "myapp-lambda-code-dev"
 }
 
 variable "chunk_lambda_s3_key" {
@@ -84,19 +75,9 @@ variable "chunk_lambda_s3_key" {
   default = "chunk.zip"
 }
 
-variable "embed_lambda_s3_bucket-kane" {
-  type    = string
-  default = "myapp-lambda-code"
-}
-
 variable "embed_lambda_s3_key" {
   type    = string
   default = "embed.zip"
-}
-
-variable "index_lambda_s3_bucket-kane" {
-  type    = string
-  default = "myapp-lambda-code"
 }
 
 variable "index_lambda_s3_key" {
@@ -106,8 +87,9 @@ variable "index_lambda_s3_key" {
 
 # Agentic ASG sizing
 variable "agentic_instance_type" {
-  type    = string
-  default = "t3.medium"
+  description = "Instance type for the agentic logic server."
+  type        = string
+  default     = "t4g.micro"
 }
 
 variable "agentic_min_size" {
@@ -123,4 +105,36 @@ variable "agentic_max_size" {
 variable "agentic_desired_capacity" {
   type    = number
   default = 1
+}
+
+# ADDED: New variable for Qdrant instance type
+variable "qdrant_instance_type" {
+  description = "Instance type for the Qdrant EC2 instance."
+  type        = string
+  default     = "t4g.micro"
+}
+
+variable "monolith_image_uri" {
+  description = "Optional: The full URI of the monolith Docker image in ECR. Leave empty to skip."
+  type        = string
+  default     = ""
+}
+
+variable "agentic_image_uri" {
+  description = "Optional: The full URI of the agentic Docker image in ECR. Leave empty to skip."
+  type        = string
+  default     = ""
+}
+
+variable "bedrock_embed_model_arn" {
+  description = "The ARN of the Bedrock model to use for embeddings."
+  type        = string
+  default     = "arn:aws:bedrock:eu-central-1::foundation-model/amazon.titan-embed-text-v1"
+}
+
+variable "qdrant_api_key" {
+  description = "The API key for the Qdrant vector database."
+  type        = string
+  sensitive   = true
+  default     = "please-change-this-insecure-default-key"
 }

@@ -28,9 +28,8 @@ resource "aws_security_group" "agentic_sg" {
 }
 
 ###############################################################################
-# 2 IAM Role & Instance Profile (for Bedrock, S3, SQS, Secrets, X-Ray, CWL)
+# 2 IAM Role & Instance Profile
 ###############################################################################
-
 data "aws_iam_policy_document" "assume_ec2" {
   statement {
     actions = ["sts:AssumeRole"]
@@ -44,6 +43,16 @@ data "aws_iam_policy_document" "assume_ec2" {
 resource "aws_iam_role" "agentic_role" {
   name               = "${var.name}-agentic-role"
   assume_role_policy = data.aws_iam_policy_document.assume_ec2.json
+}
+
+resource "aws_iam_role_policy_attachment" "agentic_ssm_policy" {
+  role       = aws_iam_role.agentic_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_role_policy_attachment" "agentic_ecr_policy" {
+  role       = aws_iam_role.agentic_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
 }
 
 data "aws_iam_policy_document" "agentic_policy" {
@@ -78,25 +87,6 @@ data "aws_iam_policy_document" "agentic_policy" {
     actions = ["secretsmanager:GetSecretValue"]
     resources = [var.secrets_manager_secret_arn]
   }
-  statement {
-    sid    = "AllowCloudWatchLogs"
-    effect = "Allow"
-    actions = [
-      "logs:CreateLogGroup",
-      "logs:CreateLogStream",
-      "logs:PutLogEvents"
-    ]
-    resources = ["arn:aws:logs:${var.region}:*:log-group:/aws/ec2/${var.name}-agentic*"]
-  }
-  statement {
-    sid    = "AllowXRay"
-    effect = "Allow"
-    actions = [
-      "xray:PutTraceSegments",
-      "xray:PutTelemetryRecords"
-    ]
-    resources = ["*"]
-  }
 }
 
 resource "aws_iam_role_policy" "agentic_policy" {
@@ -104,7 +94,6 @@ resource "aws_iam_role_policy" "agentic_policy" {
   role   = aws_iam_role.agentic_role.id
   policy = data.aws_iam_policy_document.agentic_policy.json
 }
-
 resource "aws_iam_instance_profile" "agentic_profile" {
   name = "${var.name}-agentic-profile"
   role = aws_iam_role.agentic_role.name
@@ -113,22 +102,27 @@ resource "aws_iam_instance_profile" "agentic_profile" {
 ###############################################################################
 # 3 Launch Template
 ###############################################################################
-data "aws_ami" "linux" {
+data "aws_ami" "linux_arm" {
   owners      = ["amazon"]
   most_recent = true
   filter {
     name   = "name"
-    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
+    values = ["amzn2-ami-hvm-*-arm64-gp2"]
   }
 }
 
 resource "aws_launch_template" "agentic_lt" {
   name_prefix   = "${var.name}-agentic-lt-"
-  image_id      = data.aws_ami.linux.id
+  image_id      = data.aws_ami.linux_arm.id
   instance_type = var.instance_type
 
   iam_instance_profile {
     name = aws_iam_instance_profile.agentic_profile.name
+  }
+
+  metadata_options {
+    http_tokens   = "required"
+    http_endpoint = "enabled"
   }
 
   network_interfaces {
@@ -138,18 +132,10 @@ resource "aws_launch_template" "agentic_lt" {
     associate_public_ip_address = false
   }
 
-  # FIXED: Replaced templatefile() with an inline script to avoid the error
-  # about the missing userdata.sh.tpl file.
-  user_data = base64encode(<<-EOF
-              #!/bin/bash
-              # User data script for agentic instances.
-              # This is a placeholder as userdata.sh.tpl was missing.
-              echo "Region: ${var.region}" >> /tmp/agentic_userdata.log
-              echo "S3 Bucket: ${var.s3_bucket_name}" >> /tmp/agentic_userdata.log
-              echo "SQS URL: ${var.sqs_queue_url}" >> /tmp/agentic_userdata.log
-              # Add your agentic application setup commands here.
-              EOF
-  )
+  user_data = base64encode(templatefile("${path.module}/user_data.sh.tpl", {
+    region            = var.region
+    agentic_image_uri = var.agentic_image_uri
+  }))
 }
 
 ###############################################################################
@@ -158,7 +144,8 @@ resource "aws_launch_template" "agentic_lt" {
 resource "aws_autoscaling_group" "agentic_asg" {
   name                = "${var.name}-agentic-asg"
   min_size            = var.min_size
-  max_size            = var.max_size
+  # UPDATED: max_size is now set to 4 as requested.
+  max_size            = 4
   desired_capacity    = var.desired_capacity
   vpc_zone_identifier = var.private_subnet_ids
 
@@ -174,4 +161,76 @@ resource "aws_autoscaling_group" "agentic_asg" {
     value               = "${var.name}-agentic"
     propagate_at_launch = true
   }
+}
+
+###############################################################################
+# 5 ECR Repository & CloudWatch Logs
+###############################################################################
+resource "aws_ecr_repository" "agentic" {
+  name = lower("${var.name}-agentic")
+}
+
+resource "aws_cloudwatch_log_group" "agentic_asg_logs" {
+  name              = "/aws/ec2/${var.name}-agentic"
+  retention_in_days = 7
+}
+
+###############################################################################
+# 6 Auto Scaling Policies
+###############################################################################
+
+# ADDED: Policy to scale up the ASG by one instance.
+resource "aws_autoscaling_policy" "scale_up" {
+  name                   = "${var.name}-scale-up"
+  autoscaling_group_name = aws_autoscaling_group.agentic_asg.name
+  adjustment_type        = "ChangeInCapacity"
+  scaling_adjustment     = 1
+  cooldown               = 300 # 5 minutes
+}
+
+# ADDED: CloudWatch alarm to trigger the scale-up policy when CPU is >= 70% for 5 minutes.
+resource "aws_cloudwatch_metric_alarm" "scale_up_alarm" {
+  alarm_name          = "${var.name}-cpu-high-alarm"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = "1"
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = "300" # 5 minutes in seconds
+  statistic           = "Average"
+  threshold           = "70"
+
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.agentic_asg.name
+  }
+
+  alarm_description = "This metric monitors ec2 cpu utilization"
+  alarm_actions     = [aws_autoscaling_policy.scale_up.arn]
+}
+
+# ADDED: Policy to scale down the ASG by one instance.
+resource "aws_autoscaling_policy" "scale_down" {
+  name                   = "${var.name}-scale-down"
+  autoscaling_group_name = aws_autoscaling_group.agentic_asg.name
+  adjustment_type        = "ChangeInCapacity"
+  scaling_adjustment     = -1
+  cooldown               = 600 # 10 minutes
+}
+
+# ADDED: CloudWatch alarm to trigger the scale-down policy when CPU is <= 30% for 10 minutes.
+resource "aws_cloudwatch_metric_alarm" "scale_down_alarm" {
+  alarm_name          = "${var.name}-cpu-low-alarm"
+  comparison_operator = "LessThanOrEqualToThreshold"
+  evaluation_periods  = "1"
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = "600" # 10 minutes in seconds
+  statistic           = "Average"
+  threshold           = "30"
+
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.agentic_asg.name
+  }
+
+  alarm_description = "This metric monitors ec2 cpu utilization"
+  alarm_actions     = [aws_autoscaling_policy.scale_down.arn]
 }

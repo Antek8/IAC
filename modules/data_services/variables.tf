@@ -26,16 +26,11 @@ variable "region" {
   default     = "us-east-1"
 }
 
-variable "redis_node_type" {
-  description = "ElastiCache node type"
+# ADDED: Variable for the Qdrant instance type.
+variable "qdrant_instance_type" {
+  description = "Instance type for the Qdrant EC2 instance."
   type        = string
-  default     = "cache.t3.micro"
-}
-
-variable "redis_num_clusters" {
-  description = "Number of Redis nodes"
-  type        = number
-  default     = 1
+  default     = "t4g.small"
 }
 
 variable "qdrant_container_image" {
