@@ -9,10 +9,11 @@ resource "aws_security_group" "monolith" {
   vpc_id      = var.vpc_id
 
   ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [var.alb_security_group_id] # Changed from cidr_blocks
+    description     = "Allow traffic from ALB"
   }
 
   egress {
@@ -73,6 +74,7 @@ resource "aws_autoscaling_group" "monolith_asg" {
   max_size            = 4
   desired_capacity    = var.desired_capacity
   vpc_zone_identifier = var.private_subnet_ids
+  target_group_arns = [var.target_group_arn]
 
   health_check_type = "EC2"
 

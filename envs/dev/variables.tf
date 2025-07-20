@@ -156,3 +156,9 @@ variable "confluence_sync_schedule" {
   type        = string
   default     = "cron(0 12 * * ? *)" # Once a day at noon UTC
 }
+variable "acm_certificate_arn" {
+  description = "The ARN of the ACM certificate for the ALB listener."
+  type        = string
+  # You must replace this default with your actual certificate ARN
+  default     = "arn:aws:acm:eu-central-1:218160093341:certificate/4dbe94fe-e3b7-4812-8f0f-025140c44bed"
+}

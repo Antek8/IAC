@@ -54,3 +54,12 @@ variable "tenant_id" {
   description = "The tenant identifier, used for naming and resource tagging."
   type        = string
 }
+variable "target_group_arn" {
+  description = "The ARN of the ALB target group to attach the ASG to."
+  type        = string
+}
+
+variable "alb_security_group_id" {
+  description = "The ID of the ALB's security group to allow ingress traffic from."
+  type        = string
+}

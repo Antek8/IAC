@@ -19,3 +19,7 @@ output "rag_lambda_security_group_id" {
   description = "The ID of the security group for the RAG pipeline Lambdas."
   value       = aws_security_group.rag_lambda_sg.id
 }
+output "alb_security_group_id" {
+  description = "The ID of the security group for the Application Load Balancer."
+  value       = aws_security_group.alb_sg.id
+}

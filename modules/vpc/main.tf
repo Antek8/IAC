@@ -149,3 +149,28 @@ resource "aws_vpc_endpoint" "logs" {
   subnet_ids          = aws_subnet.private_app[*].id
   security_group_ids  = [aws_security_group.vpc_endpoint_sg.id]
 }
+
+resource "aws_security_group" "alb_sg" {
+  name        = "${var.name}-alb-sg"
+  description = "Allow HTTPS inbound traffic to ALB"
+  vpc_id      = aws_vpc.this.id
+
+  ingress {
+    description = "Allow HTTPS from anywhere"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "${var.name}-alb-sg"
+  }
+}

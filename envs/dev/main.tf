@@ -101,6 +101,11 @@ module "ingress" {
   lambda_code_bucket          = aws_s3_bucket.lambda_code.id
   jwt_secret_arn              = module.data_services.secrets_manager_secret_arns_map["jwt_secret"]
 
+  vpc_id                      = module.vpc.vpc_id
+  public_subnet_ids           = module.vpc.public_subnet_ids
+  alb_security_group_id       = module.vpc.alb_security_group_id
+  acm_certificate_arn         = var.acm_certificate_arn # You'll need to add this variable
+
   depends_on = [
     aws_s3_object.generate_presigned_url_lambda_code
   ]
@@ -148,6 +153,8 @@ module "monolith_asg" {
   region                     = var.region
   monolith_image_uri         = var.monolith_image_uri
   tenant_id                  = var.tenant_id
+  target_group_arn      = module.ingress.monolith_target_group_arn
+  alb_security_group_id = module.vpc.alb_security_group_id
 
 }
 
