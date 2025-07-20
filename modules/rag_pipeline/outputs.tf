@@ -25,8 +25,12 @@ output "high_priority_queue_arn" {
   value       = aws_sqs_queue.high_priority_queue.arn
 }
 
-# FIXED: The dlq resource is now correctly defined in main.tf, so this output is valid.
 output "dlq_arn" {
   description = "ARN of dead-letter queue"
   value       = aws_sqs_queue.dlq.arn
+}
+
+output "confluence_checker_lambda_arn" {
+  description = "The ARN of the Confluence Checker Lambda function."
+  value       = aws_lambda_function.confluence_checker.arn
 }

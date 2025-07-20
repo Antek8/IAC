@@ -144,3 +144,15 @@ variable "embed_lambda_s3_key" {
   type    = string
   default = "embed.zip"
 }
+
+variable "confluence_checker_lambda_s3_key" {
+  description = "The S3 key for the Confluence checker lambda function code."
+  type        = string
+  default     = "confluence_checker.zip"
+}
+
+variable "confluence_sync_schedule" {
+  description = "The cron expression for the Confluence sync schedule."
+  type        = string
+  default     = "cron(0 12 * * ? *)" # Once a day at noon UTC
+}

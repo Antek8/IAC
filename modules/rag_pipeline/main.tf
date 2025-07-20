@@ -81,10 +81,14 @@ resource "aws_iam_role_policy" "chunk_lambda_policy" {
         Resource = "${aws_s3_bucket.rag_chunks.arn}/*"
       },
       {
-        Sid      = "SQSRead",
-        Effect   = "Allow",
-        Action   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"],
-        Resource = aws_sqs_queue.high_priority_queue.arn
+        Sid    = "SQSRead",
+        Effect = "Allow",
+        Action = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"],
+
+        Resource = [
+          aws_sqs_queue.high_priority_queue.arn,
+          aws_sqs_queue.low_priority_queue.arn
+        ]
       }
     ]
   })
@@ -212,4 +216,66 @@ data "aws_iam_policy_document" "assume_lambda" {
       identifiers = ["lambda.amazonaws.com"]
     }
   }
+}
+
+resource "aws_sqs_queue" "low_priority_queue" {
+  name = "${var.name}-rag-queue" # This is the original name you wanted
+
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.dlq.arn
+    maxReceiveCount     = 5
+  })
+}
+
+resource "aws_iam_role" "confluence_checker_lambda_role" {
+  name               = "${var.name}-confluence-checker-lambda-role"
+  assume_role_policy = data.aws_iam_policy_document.assume_lambda.json
+}
+
+resource "aws_iam_role_policy_attachment" "confluence_checker_vpc_access" {
+  role       = aws_iam_role.confluence_checker_lambda_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+}
+
+resource "aws_iam_role_policy" "confluence_checker_lambda_policy" {
+  name = "${var.name}-confluence-checker-lambda-policy"
+  role = aws_iam_role.confluence_checker_lambda_role.id
+  policy = jsonencode({
+    Version   = "2012-10-17",
+    Statement = [
+      {
+        Sid      = "SQSSendMessage",
+        Effect   = "Allow",
+        Action   = "sqs:SendMessage",
+        Resource = aws_sqs_queue.low_priority_queue.arn
+      },
+      {
+        Sid      = "SecretsManagerRead",
+        Effect   = "Allow",
+        Action   = "secretsmanager:GetSecretValue",
+        Resource = var.confluence_api_key_secret_arn
+      }
+    ]
+  })
+}
+
+resource "aws_lambda_function" "confluence_checker" {
+  function_name = "${var.name}-confluence-checker"
+  s3_bucket     = var.chunk_lambda_s3_bucket # Assuming same bucket for all lambdas
+  s3_key        = var.confluence_checker_lambda_s3_key
+  handler       = "confluence_checker.lambda_handler"
+  runtime       = "python3.9"
+  role          = aws_iam_role.confluence_checker_lambda_role.arn
+  timeout       = 300 # Increased timeout for potentially long-running sync checks
+  memory_size   = 256
+
+  vpc_config {
+    subnet_ids         = var.private_subnet_ids
+    security_group_ids = [var.lambda_security_group_id]
+  }
+}
+
+resource "aws_lambda_event_source_mapping" "chunk_trigger_low_priority" {
+  event_source_arn = aws_sqs_queue.low_priority_queue.arn
+  function_name    = aws_lambda_function.chunk.arn
 }

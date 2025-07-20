@@ -5,6 +5,52 @@ resource "aws_s3_object" "generate_presigned_url_lambda_code" {
   source = data.archive_file.dummy_lambda_zip.output_path
   etag   = filemd5(data.archive_file.dummy_lambda_zip.output_path)
 }
+
+resource "aws_s3_object" "confluence_checker_lambda_code" {
+  bucket = aws_s3_bucket.lambda_code.id
+  key    = var.confluence_checker_lambda_s3_key
+  source = data.archive_file.dummy_lambda_zip.output_path
+  etag   = filemd5(data.archive_file.dummy_lambda_zip.output_path)
+}
+
+resource "aws_iam_role" "scheduler_role" {
+  name = "${local.name_prefix}-scheduler-role"
+  assume_role_policy = jsonencode({
+    Version   = "2012-10-17",
+    Statement = [{
+      Effect    = "Allow",
+      Principal = { Service = "scheduler.amazonaws.com" },
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+resource "aws_scheduler_schedule" "confluence_sync" {
+  name       = "${local.name_prefix}-confluence-sync-schedule"
+  group_name = "default"
+
+  flexible_time_window {
+    mode = "OFF"
+  }
+
+  schedule_expression = var.confluence_sync_schedule
+
+  target {
+    arn      = module.rag_pipeline.confluence_checker_lambda_arn
+    role_arn = aws_iam_role.scheduler_role.arn
+  }
+}
+resource "aws_iam_role_policy" "scheduler_policy" {
+  name = "${local.name_prefix}-scheduler-policy"
+  role = aws_iam_role.scheduler_role.id
+  policy = jsonencode({
+    Version   = "2012-10-17",
+    Statement = [{
+      Effect   = "Allow",
+      Action   = "lambda:InvokeFunction",
+      Resource = module.rag_pipeline.confluence_checker_lambda_arn
+    }]
+  })
+}
 resource "aws_s3_bucket" "lambda_code" {
   bucket = var.lambda_code_bucket_name
 }
@@ -54,6 +100,10 @@ module "ingress" {
   priority_uploads_bucket_arn = module.rag_pipeline.priority_uploads_bucket_arn
   lambda_code_bucket          = aws_s3_bucket.lambda_code.id
   jwt_secret_arn              = module.data_services.secrets_manager_secret_arns_map["jwt_secret"]
+
+  depends_on = [
+    aws_s3_object.generate_presigned_url_lambda_code
+  ]
 }
 
 module "rag_pipeline" {
@@ -66,19 +116,20 @@ module "rag_pipeline" {
   chunk_lambda_s3_bucket = aws_s3_bucket.lambda_code.id
   chunk_lambda_s3_key    = var.chunk_lambda_s3_key
 
-  # FIXED: Added the missing required arguments for the embed lambda.
   embed_lambda_s3_bucket = aws_s3_bucket.lambda_code.id
   embed_lambda_s3_key    = var.embed_lambda_s3_key
   bedrock_embed_model_arn  = var.bedrock_embed_model_arn
   qdrant_api_key_secret_arn = module.data_services.secrets_manager_secret_arns_map["qdrant_api_key"]
+  confluence_checker_lambda_s3_key = var.confluence_checker_lambda_s3_key
+  confluence_api_key_secret_arn    = module.data_services.secrets_manager_secret_arns_map["confluence_api_key"]
 
-  # FIXED: Removed the unsupported arguments for the old index lambda.
   lambda_security_group_id  = module.vpc.rag_lambda_security_group_id
   
   depends_on = [
     aws_s3_object.chunk_lambda_code,
     aws_s3_object.embed_lambda_code,
-    aws_s3_object.generate_presigned_url_lambda_code
+    aws_s3_object.generate_presigned_url_lambda_code,
+    aws_s3_object.confluence_checker_lambda_code
   ]
 }
 
@@ -128,10 +179,12 @@ module "data_services" {
   private_subnet_ids   = module.vpc.private_app_subnet_ids
   region               = var.region
   qdrant_instance_type = var.qdrant_instance_type
+  
   secrets = {
-    "db_password"    = "changeme123"
-    "qdrant_api_key" = var.qdrant_api_key
-    "jwt_secret"     = var.jwt_secret
+    "db_password"        = "changeme123"
+    "qdrant_api_key"     = var.qdrant_api_key
+    "jwt_secret"         = var.jwt_secret
+    "confluence_api_key" = "your-confluence-api-key" # Add this line
   }
 }
 

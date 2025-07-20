@@ -60,3 +60,13 @@ variable "qdrant_api_key_secret_arn" {
   description = "The ARN of the Secrets Manager secret containing the Qdrant API key."
   type        = string
 }
+
+variable "confluence_checker_lambda_s3_key" {
+  description = "The S3 key for the Confluence checker lambda function code."
+  type        = string
+}
+
+variable "confluence_api_key_secret_arn" {
+  description = "The ARN of the Secrets Manager secret for the Confluence API key."
+  type        = string
+}
