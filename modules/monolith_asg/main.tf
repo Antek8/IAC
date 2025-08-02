@@ -23,6 +23,15 @@ resource "aws_security_group" "monolith" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 }
+resource "aws_security_group_rule" "allow_ssh_from_jump_host" {
+  type                     = "ingress"
+  from_port                = 22
+  to_port                  = 22
+  protocol                 = "tcp"
+  source_security_group_id = var.jump_host_security_group_id
+  security_group_id        = aws_security_group.monolith.id
+  description              = "Allow SSH from jump host"
+}
 ###############################################################################
 # 2 Launch Template
 ###############################################################################

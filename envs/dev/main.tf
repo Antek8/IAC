@@ -91,6 +91,8 @@ module "vpc" {
   private_app_subnet_cidrs = var.private_app_subnet_cidrs
   private_rag_subnet_cidrs = var.private_rag_subnet_cidrs
   region                   = var.region
+  fck_nat_ssh_ipv4_cidr_blocks = var.my_ips_for_ssh
+
 }
 
 module "ingress" {
@@ -155,6 +157,7 @@ module "monolith_asg" {
   tenant_id                  = var.tenant_id
   target_group_arn      = module.ingress.monolith_target_group_arn
   alb_security_group_id = module.vpc.alb_security_group_id
+  jump_host_security_group_id = module.vpc.fck_nat_security_group_id
 
 }
 
@@ -175,6 +178,8 @@ module "agentic_asg" {
   region                            = var.region
   agentic_image_uri                 = var.agentic_image_uri
   tenant_id                         = var.tenant_id
+  deploy_key_secret_arn             = var.github_deploy_key_secret_arn
+  jump_host_security_group_id = module.vpc.fck_nat_security_group_id
 
 }
 
@@ -191,7 +196,7 @@ module "data_services" {
     "db_password"        = "changeme123"
     "qdrant_api_key"     = var.qdrant_api_key
     "jwt_secret"         = var.jwt_secret
-    "confluence_api_key" = "your-confluence-api-key" # Add this line
+    "confluence_api_key" = "your-confluence-api-key"
   }
 }
 

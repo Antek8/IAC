@@ -23,3 +23,7 @@ output "alb_security_group_id" {
   description = "The ID of the security group for the Application Load Balancer."
   value       = aws_security_group.alb_sg.id
 }
+output "fck_nat_security_group_id" {
+  description = "The ID of the security group used by the fck-nat instance."
+  value       = module.fck_nat.security_group_id
+}

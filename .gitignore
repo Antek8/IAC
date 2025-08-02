@@ -1,3 +1,5 @@
 **/.terraform/
 *.tfstate
 *.tfstate.backup
+
+/home/antek/terratest/envs/dev/magi_deploy_key

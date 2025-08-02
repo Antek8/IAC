@@ -63,3 +63,8 @@ variable "alb_security_group_id" {
   description = "The ID of the ALB's security group to allow ingress traffic from."
   type        = string
 }
+
+variable "jump_host_security_group_id" {
+  description = "The security group ID of the jump host to allow SSH from."
+  type        = string
+}

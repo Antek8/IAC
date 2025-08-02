@@ -64,6 +64,10 @@ module "fck_nat" {
   ha_mode   = false
 
   update_route_tables = false
+
+  ssh_cidr_blocks = {
+    ipv4 = var.fck_nat_ssh_ipv4_cidr_blocks
+  }
 }
 
 # 4. Private Route Table

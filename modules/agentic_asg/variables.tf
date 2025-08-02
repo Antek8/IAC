@@ -62,7 +62,17 @@ variable "agentic_image_uri" {
   type        = string
   default     = ""
 }
+
 variable "tenant_id" {
   description = "The tenant identifier, used for naming and resource tagging."
+  type        = string
+}
+
+variable "deploy_key_secret_arn" {
+  description = "The ARN of the Secrets Manager secret for the GitHub deploy key."
+  type        = string
+}
+variable "jump_host_security_group_id" {
+  description = "The security group ID of the jump host to allow SSH from."
   type        = string
 }

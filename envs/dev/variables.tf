@@ -159,6 +159,16 @@ variable "confluence_sync_schedule" {
 variable "acm_certificate_arn" {
   description = "The ARN of the ACM certificate for the ALB listener."
   type        = string
-  # You must replace this default with your actual certificate ARN
   default     = "arn:aws:acm:eu-central-1:218160093341:certificate/4dbe94fe-e3b7-4812-8f0f-025140c44bed"
 }
+variable "my_ips_for_ssh" {
+  description = "List of public IP addresses allowed to SSH into the jump host."
+  type        = list(string)
+  default     = ["79.208.182.232/32","95.91.247.58/32"]
+}
+variable "github_deploy_key_secret_arn" {
+  description = "The ARN of the pre-existing Secrets Manager secret for the GitHub deploy key."
+  type        = string
+  default     = "arn:aws:secretsmanager:eu-central-1:218160093341:secret:magi_deploy_key-13sGjg"
+}
+

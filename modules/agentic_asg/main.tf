@@ -103,22 +103,39 @@ resource "aws_iam_instance_profile" "agentic_profile" {
   name = "${var.name}-agentic-profile"
   role = aws_iam_role.agentic_role.name
 }
-
+resource "aws_security_group_rule" "allow_ssh_from_jump_host" {
+  type                     = "ingress"
+  from_port                = 22
+  to_port                  = 22
+  protocol                 = "tcp"
+  source_security_group_id = var.jump_host_security_group_id
+  security_group_id        = aws_security_group.agentic_sg.id
+  description              = "Allow SSH from jump host"
+}
 ###############################################################################
 # 3 Launch Template
 ###############################################################################
-data "aws_ami" "linux_arm" {
-  owners      = ["amazon"]
+data "aws_ami" "ubuntu" {
   most_recent = true
+  owners      = ["099720109477"] # Canonical's owner ID for Ubuntu
+
   filter {
     name   = "name"
-    values = ["amzn2-ami-hvm-*-arm64-gp2"]
+    # This filter finds the latest Ubuntu 22.04 LTS for ARM64 architecture.
+    # Adjust if you need a different version or architecture (e.g., x86_64).
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-arm64-server-*"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
   }
 }
 
+# UPDATED: The launch template now uses the Ubuntu AMI and the new user_data script.
 resource "aws_launch_template" "agentic_lt" {
   name_prefix   = "${var.name}-agentic-lt-"
-  image_id      = data.aws_ami.linux_arm.id
+  image_id      = data.aws_ami.ubuntu.id # Use the new Ubuntu AMI
   instance_type = var.instance_type
 
   iam_instance_profile {
@@ -137,9 +154,11 @@ resource "aws_launch_template" "agentic_lt" {
     associate_public_ip_address = false
   }
 
-  user_data = base64encode(templatefile("${path.module}/user_data.sh.tpl", {
-    region            = var.region
-    agentic_image_uri = var.agentic_image_uri
+  # The user_data is now sourced from a new template file and passes in the secret ARN.
+  user_data = base64encode(templatefile("${path.module}/ubuntu_user_data.sh.tpl", {
+    db_secret_arn       = var.secrets_manager_secret_arn
+    deploy_key_secret_arn = var.deploy_key_secret_arn
+    region              = var.region
   }))
 }
 
