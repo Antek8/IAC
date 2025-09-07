@@ -44,3 +44,29 @@ variable "secrets" {
   type        = map(string)
   default     = {}
 }
+variable "qdrant_min_size" {
+  description = "Minimum number of instances in the Qdrant ASG."
+  type        = number
+  default     = 1
+}
+
+variable "qdrant_max_size" {
+  description = "Maximum number of instances in the Qdrant ASG."
+  type        = number
+  default     = 2
+}
+
+variable "qdrant_desired_capacity" {
+  description = "Desired number of instances in the Qdrant ASG."
+  type        = number
+  default     = 1
+}
+variable "qdrant_efs_id" {
+  description = "The ID of the EFS file system for Qdrant."
+  type        = string
+}
+
+variable "efs_security_group_id" {
+  description = "The ID of the security group for the EFS mount targets."
+  type        = string
+}

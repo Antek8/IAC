@@ -11,14 +11,13 @@ resource "aws_security_group" "agentic_sg" {
   dynamic "ingress" {
     for_each = var.allowed_source_security_group_ids
     content {
-      from_port       = 80
-      to_port         = 80
-      protocol        = "tcp"
-      security_groups = [ingress.value]
-      description     = "Allow web ASG"
+      from_port                = 80
+      to_port                  = 80
+      protocol                 = "tcp"
+      security_groups          = [ingress.value]
+      description              = "Allow web ASG"
     }
   }
-
   egress {
     from_port   = 0
     to_port     = 0
@@ -67,8 +66,10 @@ data "aws_iam_policy_document" "agentic_policy" {
   statement {
     sid       = "BedrockInvoke"
     effect    = "Allow"
-    actions   = ["bedrock:InvokeModel"]
-    # Scoped to all models for simplicity, but can be restricted to specific model ARNs.
+    actions = [
+      "bedrock:InvokeModel",
+      "bedrock:InvokeModelWithResponseStream"
+    ]    # Scoped to all models for simplicity, but can be restricted to specific model ARNs.
     resources = ["*"]
   }
 
@@ -78,8 +79,8 @@ data "aws_iam_policy_document" "agentic_policy" {
     actions   = ["secretsmanager:GetSecretValue"]
     # Allows reading any secret under the application's path.
     # This is necessary to fetch the Qdrant API key and other credentials.
-    resources = ["arn:aws:secretsmanager:${var.region}:${data.aws_caller_identity.current.account_id}:secret:/myapp/${var.tenant_id}/*"]
-  }
+    resources = ["arn:aws:secretsmanager:${var.region}:${data.aws_caller_identity.current.account_id}:secret:/${var.project}/${var.tenant_id}/*"]  
+    }
 
   statement {
     sid    = "CloudWatchLogs"
@@ -92,6 +93,19 @@ data "aws_iam_policy_document" "agentic_policy" {
     # Allows the EC2 instances to write logs for monitoring and debugging.
     resources = ["arn:aws:logs:${var.region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/ec2/${var.name}-*"]
   }
+   statement {
+     sid    = "S3Access"
+     effect = "Allow"
+     actions = [
+       "s3:GetObject",
+       "s3:PutObject",
+       "s3:ListBucket"
+     ]
+      resources = [
+        "arn:aws:s3:::*",
+        "arn:aws:s3:::*/*"
+      ]
+   }
 }
 
 resource "aws_iam_role_policy" "agentic_policy" {
@@ -115,27 +129,14 @@ resource "aws_security_group_rule" "allow_ssh_from_jump_host" {
 ###############################################################################
 # 3 Launch Template
 ###############################################################################
-data "aws_ami" "ubuntu" {
-  most_recent = true
-  owners      = ["099720109477"] # Canonical's owner ID for Ubuntu
-
-  filter {
-    name   = "name"
-    # This filter finds the latest Ubuntu 22.04 LTS for ARM64 architecture.
-    # Adjust if you need a different version or architecture (e.g., x86_64).
-    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-arm64-server-*"]
-  }
-
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
+data "aws_ssm_parameter" "ecs_ami_arm64" {
+  name = "/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id"
 }
 
 # UPDATED: The launch template now uses the Ubuntu AMI and the new user_data script.
 resource "aws_launch_template" "agentic_lt" {
   name_prefix   = "${var.name}-agentic-lt-"
-  image_id      = data.aws_ami.ubuntu.id # Use the new Ubuntu AMI
+  image_id      = data.aws_ssm_parameter.ecs_ami_arm64.value
   instance_type = var.instance_type
 
   iam_instance_profile {
@@ -153,9 +154,15 @@ resource "aws_launch_template" "agentic_lt" {
     security_groups             = [aws_security_group.agentic_sg.id]
     associate_public_ip_address = false
   }
-
+  block_device_mappings {
+    device_name = "/dev/xvda"
+    ebs {
+      volume_size = 30
+      encrypted   = true 
+    }
+  }
   # The user_data is now sourced from a new template file and passes in the secret ARN.
-  user_data = base64encode(templatefile("${path.module}/ubuntu_user_data.sh.tpl", {
+  user_data = base64encode(templatefile("${path.module}/user_data.sh.tpl", {
     db_secret_arn       = var.secrets_manager_secret_arn
     deploy_key_secret_arn = var.deploy_key_secret_arn
     region              = var.region
@@ -178,12 +185,18 @@ resource "aws_autoscaling_group" "agentic_asg" {
   }
 
   health_check_type = "EC2"
+  #health_check_type         = "ELB"
+  #health_check_grace_period = 60 # Add a grace period (recommended)
 
   tag {
     key                 = "Name"
     value               = "${var.name}-agentic"
     propagate_at_launch = true
   }
+   termination_policies = [
+    "OldestInstance",
+    "ClosestToNextInstanceHour"
+  ]
 }
 
 ###############################################################################
@@ -197,7 +210,21 @@ resource "aws_cloudwatch_log_group" "agentic_asg_logs" {
   name              = "/aws/ec2/${var.name}-agentic"
   retention_in_days = 7
 }
-
+resource "aws_ecr_lifecycle_policy" "agentic_lifecycle" {
+  repository = aws_ecr_repository.agentic.name
+  policy     = jsonencode({
+    rules = [{
+      rulePriority = 1
+      description  = "Keep last 10 images"
+      selection = {
+        tagStatus   = "any"
+        countType   = "imageCountMoreThan"
+        countNumber = 10
+      }
+      action = { type = "expire" }
+    }]
+  })
+}
 ###############################################################################
 # 6 Auto Scaling Policies
 ###############################################################################

@@ -76,3 +76,7 @@ variable "jump_host_security_group_id" {
   description = "The security group ID of the jump host to allow SSH from."
   type        = string
 }
+variable "project" {
+  description = "The project name, used for resource tagging and naming."
+  type        = string
+}

@@ -1,4 +1,4 @@
-# modules/monolith_asg/variables.tf
+# modules/frontend_asg/variables.tf
 
 variable "name" {
   type = string
@@ -8,7 +8,7 @@ variable "vpc_id" {
   type = string
 }
 
-variable "private_subnet_ids" {
+variable "public_subnet_ids" {
   type = list(string)
 }
 
@@ -45,8 +45,8 @@ variable "region" {
   default = "eu-central-1"
 }
 
-variable "monolith_image_uri" {
-  description = "Optional full image URI for the monolith container to pull and run. If empty, no container will be launched."
+variable "frontend_image_uri" {
+  description = "Optional full image URI for the frontend container to pull and run. If empty, no container will be launched."
   type        = string
   default     = ""
 }
@@ -66,5 +66,9 @@ variable "alb_security_group_id" {
 
 variable "jump_host_security_group_id" {
   description = "The security group ID of the jump host to allow SSH from."
+  type        = string
+}
+variable "project" {
+  description = "The project name, used for resource tagging and naming."
   type        = string
 }

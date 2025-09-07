@@ -61,7 +61,7 @@ module "fck_nat" {
   name      = "${var.name}-fck-nat"
   vpc_id    = aws_vpc.this.id
   subnet_id = aws_subnet.public[0].id
-  ha_mode   = false
+  ha_mode   = true
 
   update_route_tables = false
 
@@ -152,6 +152,36 @@ resource "aws_vpc_endpoint" "logs" {
   private_dns_enabled = true
   subnet_ids          = aws_subnet.private_app[*].id
   security_group_ids  = [aws_security_group.vpc_endpoint_sg.id]
+}
+# ADDED: EFS resources for persistent Qdrant storage.
+resource "aws_efs_file_system" "qdrant_storage" {
+  creation_token = "${var.name}-qdrant-efs"
+  tags = {
+    Name = "${var.name}-qdrant-storage"
+  }
+}
+
+resource "aws_efs_mount_target" "qdrant" {
+  count           = length(var.private_app_subnet_cidrs)
+  file_system_id  = aws_efs_file_system.qdrant_storage.id
+  subnet_id       = aws_subnet.private_app[count.index].id
+  security_groups = [aws_security_group.efs_sg.id]
+}
+
+# ADDED: Security group to allow Qdrant instances to connect to EFS.
+resource "aws_security_group" "efs_sg" {
+  name        = "${var.name}-efs-sg"
+  description = "Allow NFS traffic for EFS"
+  vpc_id      = aws_vpc.this.id
+
+  # Ingress is managed by specific rules from other services.
+  # Egress to allow NFS traffic back to clients.
+  egress {
+    from_port   = 2049
+    to_port     = 2049
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
 }
 
 resource "aws_security_group" "alb_sg" {

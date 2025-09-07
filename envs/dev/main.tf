@@ -142,18 +142,19 @@ module "rag_pipeline" {
 
 module "monolith_asg" {
   source                     = "../../modules/monolith_asg"
-  name                       = "${local.name_prefix}-web"
+  name                       = "${local.name_prefix}-frontend"
   vpc_id                     = module.vpc.vpc_id
-  private_subnet_ids         = module.vpc.private_app_subnet_ids
+  project                    = var.project
+  public_subnet_ids          = module.vpc.public_subnet_ids
   instance_type              = var.web_instance_type
   min_size                   = var.web_min_size
   max_size                   = var.web_max_size
   desired_capacity           = var.web_desired_capacity
   assets_bucket              = aws_s3_bucket.monolith_assets.bucket
   sqs_queue_arn              = module.rag_pipeline.high_priority_queue_arn
-  secrets_manager_secret_arn = module.data_services.secrets_manager_secret_arns_map["db_password"]
+  secrets_manager_secret_arn  = module.data_services.secrets_manager_secret_arns_map["db_password"]  
   region                     = var.region
-  monolith_image_uri         = var.monolith_image_uri
+  frontend_image_uri         = var.monolith_image_uri
   tenant_id                  = var.tenant_id
   target_group_arn      = module.ingress.monolith_target_group_arn
   alb_security_group_id = module.vpc.alb_security_group_id
@@ -163,8 +164,9 @@ module "monolith_asg" {
 
 module "agentic_asg" {
   source                            = "../../modules/agentic_asg"
-  name                              = "${local.name_prefix}-agentic"
+  name                              = "${local.name_prefix}-agent"
   vpc_id                            = module.vpc.vpc_id
+  project                           = var.project
   private_subnet_ids                = module.vpc.private_app_subnet_ids
   allowed_source_security_group_ids = [module.monolith_asg.security_group_id]
   instance_type                     = var.agentic_instance_type
@@ -187,11 +189,15 @@ module "data_services" {
   source               = "../../modules/data_services"
   name                 = local.name_prefix
   tenant_id            = var.tenant_id
+  qdrant_efs_id        = module.vpc.qdrant_efs_id
+  efs_security_group_id = module.vpc.efs_security_group_id
   vpc_id               = module.vpc.vpc_id
   private_subnet_ids   = module.vpc.private_app_subnet_ids
   region               = var.region
   qdrant_instance_type = var.qdrant_instance_type
-  
+  qdrant_min_size      = 1
+  qdrant_max_size      = 4
+  qdrant_desired_capacity = 1
   secrets = {
     "db_password"        = "changeme123"
     "qdrant_api_key"     = var.qdrant_api_key
@@ -208,7 +214,15 @@ module "iam" {
   sqs_queue_arn              = module.rag_pipeline.high_priority_queue_arn
   secrets_manager_secret_arn = module.data_services.secrets_manager_secret_arns_map["db_password"]
 }
-
+resource "aws_security_group_rule" "allow_qdrant_to_efs" {
+  type                     = "ingress"
+  description              = "Allow Qdrant ASG to access EFS"
+  from_port                = 2049 # NFS port for EFS
+  to_port                  = 2049
+  protocol                 = "tcp"
+  source_security_group_id = module.data_services.data_services_security_group_id
+  security_group_id        = module.vpc.efs_security_group_id
+}
 resource "aws_security_group_rule" "agentic_to_data_qdrant" {
   type                     = "ingress"
   from_port                = 6333

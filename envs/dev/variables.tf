@@ -2,7 +2,7 @@
 
 variable "project" {
   type    = string
-  default = "myapp"
+  default = "magi"
 }
 
 variable "environment" {
@@ -12,7 +12,7 @@ variable "environment" {
 
 variable "tenant_id" {
   type    = string
-  default = "T001"
+  default = "SK"
 }
 
 variable "region" {
@@ -45,7 +45,7 @@ variable "private_rag_subnet_cidrs" {
 variable "web_instance_type" {
   description = "Instance type for the monolith web server."
   type        = string
-  default     = "t4g.micro"
+  default     = "t4g.medium"
 }
 
 variable "web_min_size" {
@@ -67,7 +67,7 @@ variable "web_desired_capacity" {
 variable "lambda_code_bucket_name" {
   description = "The name of the S3 bucket for Lambda function code."
   type        = string
-  default     = "myapp-lambda-code-dev"
+  default     = "magi-lambda-code-dev"
 }
 
 variable "chunk_lambda_s3_key" {
@@ -84,7 +84,7 @@ variable "index_lambda_s3_key" {
 variable "agentic_instance_type" {
   description = "Instance type for the agentic logic server."
   type        = string
-  default     = "t4g.micro"
+  default     = "t4g.medium"
 }
 
 variable "agentic_min_size" {

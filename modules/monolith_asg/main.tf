@@ -1,19 +1,56 @@
-# modules/monolith_asg/main.tf
+# modules/monolith/main.tf
 
 ###############################################################################
-# 1 Monolith EC2 Security Group
+# 1 frontend EC2 Security Group
 ###############################################################################
-resource "aws_security_group" "monolith" {
+locals {
+  ssh_ips   = ["79.208.187.246/32", "95.91.247.58/32"]
+  http_ips  = ["79.208.187.246/32", "95.91.247.58/32"]
+  app_ports = [3000]
+}
+
+resource "aws_security_group" "frontend" {
   name        = "${var.name}-sg"
-  description = "Allow HTTP inbound to Monolith (React + Supertokens)"
+  description = "Frontend SG (HTTP + SSH + app)"
   vpc_id      = var.vpc_id
 
+  dynamic "ingress" {
+    for_each = local.ssh_ips
+    content {
+      from_port   = 22
+      to_port     = 22
+      protocol    = "tcp"
+      cidr_blocks = [ingress.value]
+    }
+  }
+
+  dynamic "ingress" {
+    for_each = local.http_ips
+    content {
+      from_port   = 80
+      to_port     = 80
+      protocol    = "tcp"
+      cidr_blocks = [ingress.value]
+      description = "Allow HTTP traffic from specific IPs"
+    }
+  }
+
+  dynamic "ingress" {
+    for_each = local.http_ips
+    content {
+      from_port   = 3000
+      to_port     = 3000
+      protocol    = "tcp"
+      cidr_blocks = [ingress.value]
+    }
+  }
+
   ingress {
-    from_port       = 80
-    to_port         = 80
-    protocol        = "tcp"
-    security_groups = [var.alb_security_group_id] # Changed from cidr_blocks
-    description     = "Allow traffic from ALB"
+    from_port                = 22
+    to_port                  = 22
+    protocol                 = "tcp"
+    security_groups          = [var.jump_host_security_group_id]    
+    description              = "Allow SSH from jump host"
   }
 
   egress {
@@ -23,34 +60,20 @@ resource "aws_security_group" "monolith" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 }
-resource "aws_security_group_rule" "allow_ssh_from_jump_host" {
-  type                     = "ingress"
-  from_port                = 22
-  to_port                  = 22
-  protocol                 = "tcp"
-  source_security_group_id = var.jump_host_security_group_id
-  security_group_id        = aws_security_group.monolith.id
-  description              = "Allow SSH from jump host"
-}
+
 ###############################################################################
 # 2 Launch Template
 ###############################################################################
-data "aws_ami" "linux_arm" {
-  owners      = ["amazon"]
-  most_recent = true
-  filter {
-    name   = "name"
-    values = ["amzn2-ami-hvm-*-arm64-gp2"]
-  }
+data "aws_ssm_parameter" "ecs_ami_arm64" {
+  name = "/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id"
 }
-
-resource "aws_launch_template" "monolith" {
+resource "aws_launch_template" "frontend" {
   name_prefix   = "${var.name}-lt-"
-  image_id      = data.aws_ami.linux_arm.id
+  image_id = data.aws_ssm_parameter.ecs_ami_arm64.value
   instance_type = var.instance_type
 
   iam_instance_profile {
-    name = aws_iam_instance_profile.monolith_profile.name
+    name = aws_iam_instance_profile.frontend_profile.name
   }
 
   metadata_options {
@@ -59,49 +82,56 @@ resource "aws_launch_template" "monolith" {
   }
 
   network_interfaces {
-    subnet_id                   = element(var.private_subnet_ids, 0)
-    security_groups             = [aws_security_group.monolith.id]
-    associate_public_ip_address = false
+    subnet_id                   = element(var.public_subnet_ids, 0)
+    security_groups             = [aws_security_group.frontend.id]
+    associate_public_ip_address = true
   }
-
+  block_device_mappings {
+    device_name = "/dev/xvda"
+    ebs {
+      volume_size = 30
+      encrypted   = true
+      delete_on_termination = true
+    }
+  }
   user_data = base64encode(templatefile("${path.module}/user_data.sh.tpl", {
     region             = var.region
-    monolith_image_uri = var.monolith_image_uri
+    frontend_image_uri = var.frontend_image_uri
   }))
 }
 
 ###############################################################################
 # 3 ASG
 ###############################################################################
-resource "aws_autoscaling_group" "monolith_asg" {
+resource "aws_autoscaling_group" "frontend_asg" {
   name = "${var.name}-asg"
   launch_template {
-    id      = aws_launch_template.monolith.id
+    id      = aws_launch_template.frontend.id
     version = "$Latest"
   }
   min_size            = var.min_size
   max_size            = 4
   desired_capacity    = var.desired_capacity
-  vpc_zone_identifier = var.private_subnet_ids
+  vpc_zone_identifier = var.public_subnet_ids
   target_group_arns = [var.target_group_arn]
 
   health_check_type = "EC2"
 
   tag {
     key                 = "Name"
-    value               = "${var.name}-monolith"
+    value               = var.name
     propagate_at_launch = true
   }
 }
 
 
 ##################################################################
-### IAM Role for Monolith EC2 ###
+### IAM Role for frontend EC2 ###
 ##################################################################
 data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
 
-data "aws_iam_policy_document" "monolith_assume" {
+data "aws_iam_policy_document" "frontend_assume" {
   statement {
     actions = ["sts:AssumeRole"]
     principals {
@@ -111,31 +141,31 @@ data "aws_iam_policy_document" "monolith_assume" {
   }
 }
 
-resource "aws_iam_role" "monolith_role" {
-  name               = "${var.name}-monolith-role"
-  assume_role_policy = data.aws_iam_policy_document.monolith_assume.json
+resource "aws_iam_role" "frontend_role" {
+  name               = "${var.name}-role"
+  assume_role_policy = data.aws_iam_policy_document.frontend_assume.json
 }
 
 # ADDED: Attaching the specified managed policies directly to the role.
 resource "aws_iam_role_policy_attachment" "ssm_core" {
-  role       = aws_iam_role.monolith_role.name
+  role       = aws_iam_role.frontend_role.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
 resource "aws_iam_role_policy_attachment" "ecs_for_ec2" {
-  role       = aws_iam_role.monolith_role.name
+  role       = aws_iam_role.frontend_role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
 }
 
 resource "aws_iam_role_policy_attachment" "ecr_read_only" {
-  role       = aws_iam_role.monolith_role.name
+  role       = aws_iam_role.frontend_role.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
 }
 
 
 # UPDATED: Replaced the previous broad policy with the new least-privilege inline policy.
-data "aws_iam_policy_document" "monolith_policy" {
-  # This policy grants the Monolith (UI) ASG the permissions it needs to
+data "aws_iam_policy_document" "frontend_policy" {
+  # This policy grants the frontend (UI) ASG the permissions it needs to
   # serve the frontend, interact with the backend, and manage assets.
 
   statement {
@@ -144,25 +174,24 @@ data "aws_iam_policy_document" "monolith_policy" {
     actions = [
       "execute-api:Invoke"
     ]
-    # Allows the monolith's backend to call the API Gateway endpoint
+    # Allows the frontend's backend to call the API Gateway endpoint
     # to initiate the secure file upload process.
     resources = ["arn:aws:execute-api:${var.region}:${data.aws_caller_identity.current.account_id}:*/*"]
   }
 
   statement {
-    sid    = "AppS3Access"
-    effect = "Allow"
-    actions = [
-      "s3:GetObject",
-      "s3:PutObject"
-    ]
-    # Allows the application to read and write its own static assets,
-    # such as images, CSS, or user-generated content for the UI.
-    resources = [
-      "arn:aws:s3:::${var.assets_bucket}",
-      "arn:aws:s3:::${var.assets_bucket}/*"
-    ]
-  }
+      sid    = "S3Access"
+      effect = "Allow"
+      actions = [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:ListBucket"
+      ]
+        resources = [
+          "arn:aws:s3:::*",
+          "arn:aws:s3:::*/*"
+        ]
+    }
 
   statement {
     sid    = "AppSecretsAccess"
@@ -172,8 +201,8 @@ data "aws_iam_policy_document" "monolith_policy" {
     ]
     # Allows the application to fetch its own necessary secrets,
     # like database passwords or third-party API keys.
-    resources = ["arn:aws:secretsmanager:${var.region}:${data.aws_caller_identity.current.account_id}:secret:/myapp/${var.tenant_id}/*"]
-  }
+    resources = ["arn:aws:secretsmanager:${var.region}:${data.aws_caller_identity.current.account_id}:secret:/${var.project}/${var.tenant_id}/*"]  
+    }
 
   statement {
     sid    = "CloudWatchLogs"
@@ -188,22 +217,22 @@ data "aws_iam_policy_document" "monolith_policy" {
   }
 }
 
-resource "aws_iam_role_policy" "monolith_policy" {
-  name   = "${var.name}-monolith-inline-policy"
-  role   = aws_iam_role.monolith_role.id
-  policy = data.aws_iam_policy_document.monolith_policy.json
+resource "aws_iam_role_policy" "frontend_policy" {
+  name   = "${var.name}-inline-policy"
+  role   = aws_iam_role.frontend_role.id
+  policy = data.aws_iam_policy_document.frontend_policy.json
 }
 
-resource "aws_iam_instance_profile" "monolith_profile" {
-  name = "${var.name}-monolith-profile"
-  role = aws_iam_role.monolith_role.name
+resource "aws_iam_instance_profile" "frontend_profile" {
+  name = "${var.name}-profile"
+  role = aws_iam_role.frontend_role.name
 }
 
 ###############################################################################
 # 5 ECR Repository
 ###############################################################################
-resource "aws_ecr_repository" "monolith" {
-  name = lower("${var.name}-monolith")
+resource "aws_ecr_repository" "frontend" {
+  name = lower(var.name)
 }
 
 ###############################################################################
@@ -212,7 +241,7 @@ resource "aws_ecr_repository" "monolith" {
 
 resource "aws_autoscaling_policy" "scale_up" {
   name                   = "${var.name}-scale-up"
-  autoscaling_group_name = aws_autoscaling_group.monolith_asg.name
+  autoscaling_group_name = aws_autoscaling_group.frontend_asg.name
   adjustment_type        = "ChangeInCapacity"
   scaling_adjustment     = 1
   cooldown               = 300 # 5 minutes
@@ -229,7 +258,7 @@ resource "aws_cloudwatch_metric_alarm" "scale_up_alarm" {
   threshold           = "70"
 
   dimensions = {
-    AutoScalingGroupName = aws_autoscaling_group.monolith_asg.name
+    AutoScalingGroupName = aws_autoscaling_group.frontend_asg.name
   }
 
   alarm_description = "This metric monitors ec2 cpu utilization"
@@ -238,7 +267,7 @@ resource "aws_cloudwatch_metric_alarm" "scale_up_alarm" {
 
 resource "aws_autoscaling_policy" "scale_down" {
   name                   = "${var.name}-scale-down"
-  autoscaling_group_name = aws_autoscaling_group.monolith_asg.name
+  autoscaling_group_name = aws_autoscaling_group.frontend_asg.name
   adjustment_type        = "ChangeInCapacity"
   scaling_adjustment     = -1
   cooldown               = 600 # 10 minutes
@@ -255,7 +284,7 @@ resource "aws_cloudwatch_metric_alarm" "scale_down_alarm" {
   threshold           = "30"
 
   dimensions = {
-    AutoScalingGroupName = aws_autoscaling_group.monolith_asg.name
+    AutoScalingGroupName = aws_autoscaling_group.frontend_asg.name
   }
 
   alarm_description = "This metric monitors ec2 cpu utilization"

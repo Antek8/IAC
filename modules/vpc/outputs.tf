@@ -27,3 +27,12 @@ output "fck_nat_security_group_id" {
   description = "The ID of the security group used by the fck-nat instance."
   value       = module.fck_nat.security_group_id
 }
+output "qdrant_efs_id" {
+  description = "The ID of the EFS file system for Qdrant."
+  value       = aws_efs_file_system.qdrant_storage.id
+}
+
+output "efs_security_group_id" {
+  description = "The ID of the security group for the EFS mount targets."
+  value       = aws_security_group.efs_sg.id
+}

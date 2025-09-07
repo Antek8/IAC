@@ -19,14 +19,10 @@ resource "aws_security_group" "data_services_sg" {
 ###############################################################################
 # 1 Qdrant on EC2
 ###############################################################################
+data "aws_caller_identity" "current" {}
 
-data "aws_ami" "ecs_optimized_arm" {
-  most_recent = true
-  owners      = ["amazon"]
-  filter {
-    name   = "name"
-    values = ["amzn2-ami-ecs-hvm-*-arm64-ebs"]
-  }
+data "aws_ssm_parameter" "ecs_ami_arm64" {
+  name = "/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id"
 }
 
 resource "aws_iam_role" "qdrant_ec2_role" {
@@ -44,7 +40,24 @@ resource "aws_iam_role" "qdrant_ec2_role" {
     ]
   })
 }
-
+resource "aws_iam_role_policy" "qdrant_cloudwatch_policy" {
+  name = "${var.name}-qdrant-cloudwatch-policy"
+  role = aws_iam_role.qdrant_ec2_role.id
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Sid    = "CloudWatchLogs",
+        Effect = "Allow",
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ],
+        Resource = "arn:aws:logs:${var.region}:${data.aws_caller_identity.current.account_id}:log-group:${var.name}-qdrant-ec2-logs:*"      }
+    ]
+  })
+}
 resource "aws_iam_role_policy_attachment" "qdrant_ssm_policy" {
   role       = aws_iam_role.qdrant_ec2_role.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
@@ -60,60 +73,133 @@ resource "aws_iam_instance_profile" "qdrant_ec2_profile" {
   role = aws_iam_role.qdrant_ec2_role.name
 }
 
-resource "aws_instance" "qdrant" {
-  ami                  = data.aws_ami.ecs_optimized_arm.id
-  # FIXED: Use the new variable for the instance type.
-  instance_type        = var.qdrant_instance_type
-  subnet_id            = var.private_subnet_ids[0]
-  vpc_security_group_ids = [aws_security_group.data_services_sg.id]
-  iam_instance_profile = aws_iam_instance_profile.qdrant_ec2_profile.name
+resource "aws_launch_template" "qdrant" {
+  name_prefix   = "${var.name}-qdrant-lt-"
+  image_id      = data.aws_ssm_parameter.ecs_ami_arm64.value
+  instance_type = var.qdrant_instance_type
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.qdrant_ec2_profile.name
+  }
 
   metadata_options {
     http_tokens   = "required"
     http_endpoint = "enabled"
   }
 
-  root_block_device {
-    volume_size = 30
+  network_interfaces {
+    device_index    = 0
+    security_groups = [aws_security_group.data_services_sg.id]
   }
 
-  user_data = <<-EOF
-              #!/bin/bash
-              # Create Docker daemon configuration file
-              cat <<'EOT' > /etc/docker/daemon.json
-              {
-                "log-driver": "awslogs",
-                "log-opts": {
-                  "awslogs-group": "${var.name}-qdrant-ec2-logs",
-                  "awslogs-region": "${var.region}",
-                  "awslogs-create-group": "true"
-                }
-              }
-              EOT
+  block_device_mappings {
+    device_name = "/dev/xvda"
+    ebs {
+      volume_size = 30
+      encrypted   = true
+    }
+  }
 
-              # Restart Docker to apply the new configuration
-              systemctl restart docker
+  user_data = base64encode(templatefile("${path.module}/qdrant_user_data.sh.tpl", {
+    efs_id = var.qdrant_efs_id
+    region = var.region
+    name   = var.name
+  }))
+}
+resource "aws_iam_role_policy" "qdrant_s3_policy" {
+  name = "${var.name}-qdrant-s3-policy"
+  role = aws_iam_role.qdrant_ec2_role.id
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Sid    = "AllowS3Access",
+        Effect = "Allow",
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:ListBucket"
+        ],
+        Resource = [
+          "arn:aws:s3:::*",
+          "arn:aws:s3:::*/*"
+        ]
+      }
+    ]
+  })
+}
+resource "aws_autoscaling_group" "qdrant" {
+  name                = "${var.name}-qdrant-asg"
+  vpc_zone_identifier = var.private_subnet_ids
+  min_size            = var.qdrant_min_size
+  max_size            = var.qdrant_max_size
+  desired_capacity    = var.qdrant_desired_capacity
 
-              # Run Qdrant container, which will now log to CloudWatch automatically
-              mkdir -p /opt/qdrant/storage
-              docker run -d -p 6333:6333 -v /opt/qdrant/storage:/qdrant/storage qdrant/qdrant:latest
-              EOF
+  launch_template {
+    id      = aws_launch_template.qdrant.id
+    version = "$Latest"
+  }
 
-  tags = {
-    Name = "${var.name}-qdrant-ec2"
+  tag {
+    key                 = "Name"
+    value               = "${var.name}-qdrant"
+    propagate_at_launch = true
   }
 }
+
+resource "aws_autoscaling_policy" "qdrant_scale_up" {
+  name                   = "${var.name}-qdrant-scale-up"
+  autoscaling_group_name = aws_autoscaling_group.qdrant.name
+  adjustment_type        = "ChangeInCapacity"
+  scaling_adjustment     = 1
+  cooldown               = 300
+}
+
+resource "aws_cloudwatch_metric_alarm" "qdrant_cpu_high" {
+  alarm_name          = "${var.name}-qdrant-cpu-high"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = "1"
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = "300"
+  statistic           = "Average"
+  threshold           = "70"
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.qdrant.name
+  }
+  alarm_actions = [aws_autoscaling_policy.qdrant_scale_up.arn]
+}
+
+resource "aws_autoscaling_policy" "qdrant_scale_down" {
+  name                   = "${var.name}-qdrant-scale-down"
+  autoscaling_group_name = aws_autoscaling_group.qdrant.name
+  adjustment_type        = "ChangeInCapacity"
+  scaling_adjustment     = -1
+  cooldown               = 600
+}
+
+resource "aws_cloudwatch_metric_alarm" "qdrant_cpu_low" {
+  alarm_name          = "${var.name}-qdrant-cpu-low"
+  comparison_operator = "LessThanOrEqualToThreshold"
+  evaluation_periods  = "1"
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = "600"
+  statistic           = "Average"
+  threshold           = "30"
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.qdrant.name
+  }
+  alarm_actions = [aws_autoscaling_policy.qdrant_scale_down.arn]
+}
+
 
 ###############################################################################
 # 2 Secrets Manager
 ###############################################################################
-resource "random_pet" "secret_suffix" {
-  length = 2
-}
-
 resource "aws_secretsmanager_secret" "this" {
   for_each                = var.secrets
-  name                    = "/myapp/${var.tenant_id}/${each.key}-${random_pet.secret_suffix.id}"
+  name                    = "/magi/${var.tenant_id}/${each.key}"
   description             = "Auto-generated secret for ${each.key}"
   recovery_window_in_days = 0
 }
@@ -123,3 +209,4 @@ resource "aws_secretsmanager_secret_version" "this" {
   secret_id     = aws_secretsmanager_secret.this[each.key].id
   secret_string = each.value
 }
+
